@@ -1,0 +1,11 @@
+// os_bindings.lxs — DracolaxOS native OS API demo
+// Calls into the OS via the lxs native binding layer
+
+// Draw text to the framebuffer
+fb_print(100, 100, "Hello from LXScript!", 0xF0F0FF, 0x0D1117)
+
+// Sleep for 500ms
+sleep(500)
+
+// Log a message to the kernel log
+klog("LXSCRIPT", "os_bindings.lxs executed OK")

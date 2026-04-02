@@ -1,0 +1,8 @@
+*.o
+*.bin
+*.iso
+*.log
+*.txt
+*updates/
+*.zip
+*.elf

@@ -1,0 +1,20 @@
+// hello.lxs — DracolaxOS LXScript sample
+// Run: lxs run hello.lxs
+
+fn greet(name: str) {
+    print("Hello from DracolaxOS, " + name + "!")
+}
+
+let x: int = 42
+let msg: str = "DracolaxOS LXScript v1"
+
+print(msg)
+greet("world")
+
+// Fibonacci
+fn fib(n: int) -> int {
+    if n <= 1 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+
+print(fib(10))

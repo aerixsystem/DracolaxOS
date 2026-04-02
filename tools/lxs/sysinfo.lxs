@@ -1,0 +1,5 @@
+// sysinfo.lxs — simple system info script
+print("DracolaxOS LXScript Runtime");
+print("----------------------------");
+let version = 2;
+print(version);
