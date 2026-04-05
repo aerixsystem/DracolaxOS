@@ -1,4 +1,4 @@
-<img src="storage/main/system/images/icon.png" align="left" width="60" height="60" style="margin-right: 15px;">
+<img src="storage/main/system/images/icon-white.svg" align="left" width="60" height="60" style="margin-right: 15px;">
 
 # DracolaxOS
 
