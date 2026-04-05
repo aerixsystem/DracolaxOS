@@ -1,4 +1,5 @@
-<img src="storage/main/system/images/icon.png" align="left" width="60" height="60" style="margin-right: 15px;"\>
+<img src="storage/main/system/images/icon.png" align="left" width="60" height="60" style="margin-right: 15px;">
+
 # DracolaxOS
 
 A custom x86\_64 operating system built from scratch in C and Assembly. 💻🐉
