@@ -1,6 +1,6 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="./storage/main/system/images/icon-white.svg">
-  <source media="(prefers-color-scheme: light)" srcset="./storage/main/system/images/icon-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="./storage/main/system/images/icon-black.svg">
   <img align="left" width="60" height="60" style="margin-right: 15px;" src="./storage/main/system/images/icon-dark.svg">
 </picture>
 
