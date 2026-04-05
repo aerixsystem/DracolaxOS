@@ -6,8 +6,6 @@
 
 # DracolaxOS
 
-# DracolaxOS
-
 A custom x86\_64 operating system built from scratch in C and Assembly. 💻🐉
 
 ## Overview 🛠️
