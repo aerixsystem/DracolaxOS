@@ -39,6 +39,7 @@
 #define KB_KEY_SHIFT    0xA0
 #define KB_KEY_CTRL     0xA1
 #define KB_KEY_ALT      0xA2
+#define KB_KEY_CAPS     0xA3   /* Caps Lock — key_state[KB_KEY_CAPS] = 1 when active */
 
 /* ---- API ---------------------------------------------------------------- */
 
@@ -62,6 +63,7 @@ int  keyboard_key_down(uint8_t keycode);
 int  keyboard_shift(void);
 int  keyboard_ctrl(void);
 int  keyboard_alt(void);
+int  keyboard_caps_lock(void);   /* 1 when Caps Lock is active */
 
 /** Re-enable PS/2 kbd IRQ after mouse init. Call once from main.c. */
 void keyboard_reinit(void);

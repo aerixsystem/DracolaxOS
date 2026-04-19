@@ -20,6 +20,8 @@ uint8_t  mouse_get_buttons(void);
 /* Edge-detect helpers: true on the FIRST frame a button is down/up */
 int      mouse_btn_pressed (uint8_t mask);  /* pressed this frame   */
 int      mouse_btn_released(uint8_t mask);  /* released this frame  */
+int      mouse_btn_held    (uint8_t mask);  /* currently down       */
+int      mouse_btn_released(uint8_t mask);  /* released this frame  */
 
 /* Call once per frame BEFORE reading btn_pressed/released */
 void     mouse_update_edges(void);

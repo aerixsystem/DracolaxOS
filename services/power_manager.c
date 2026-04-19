@@ -29,6 +29,9 @@ static inline void outb(uint16_t port, uint8_t val) {
 static inline void outw(uint16_t port, uint16_t val) {
     __asm__ volatile ("outw %0, %1" :: "a"(val), "Nd"(port));
 }
+static inline void outl(uint16_t port, uint32_t val) {
+    __asm__ volatile ("outl %0, %1" :: "a"(val), "Nd"(port));
+}
 static inline uint8_t inb(uint16_t port) {
     uint8_t v;
     __asm__ volatile ("inb %1, %0" : "=a"(v) : "Nd"(port));
@@ -49,40 +52,38 @@ static inline uint8_t inb(uint16_t port) {
 void power_shutdown(void) {
     kinfo("POWER: shutdown requested\n");
 
-    /* 1. QEMU isa-debug-exit (added via -device isa-debug-exit,iobase=0x604)
-     *    Writing value V causes QEMU to exit with code (V*2+1).
-     *    FIX C: isa-debug-exit default iosize=2 → use outw(), not outb().
-     *    outb() to a 2-byte-wide device is silently ignored by QEMU's I/O
-     *    dispatch.  outw(0x604, 0x0031) → exit code (0x31<<1)|1 = 99. */
-    outw(0x604, 0x0031);   /* FIX C: was outb(0x604, 0x31) — wrong width for iosize=2 */
+    /* 1. QEMU isa-debug-exit — Makefile adds:
+     *      -device isa-debug-exit,iobase=0x604,iosize=0x04
+     *    iosize=4 means the device uses a 32-bit port.  outw() (16-bit) is
+     *    silently ignored by QEMU's I/O dispatch for a 32-bit-wide device.
+     *    Writing any value V causes QEMU to exit with code (V<<1)|1. */
+    outl(0x604, 0x00000001);   /* exit code 3 — clean shutdown signal */
 
-    /* 2. QEMU ACPI PM1a: SLP_EN(bit13) | SLP_TYP=5 S5(bits[12:10]=0b101=0x1400)
-     *    FIX C: was 0x2000 which is SLP_TYP=0 (S0/wake) — wrong sleep state. */
-    outw(0xB004, 0x3400);  /* FIX C: 0x3400 = SLP_EN(0x2000) | SLP_TYP_S5(0x1400) */
+    /* 2. QEMU ACPI PM1a control register (i440fx/PIIX4 chipset).
+     *    SLP_EN (bit 13) | SLP_TYP = 5 (S5 soft-off, bits 12:10 = 0b101).
+     *    0x2000 = SLP_EN, 0x1400 = SLP_TYP_S5 → combined = 0x3400. */
+    outw(0xB004, 0x3400);
 
-    /* 3. VirtualBox ACPI shutdown port */
+    /* 3. QEMU newer chipsets (Q35 / ICH9) — ACPI PM1a at different base */
     outw(0x4004, 0x3400);
 
-    /* 4. Bochs/QEMU legacy shutdown string port */
+    /* 4. VirtualBox ACPI port */
+    outw(0x4004, 0x3400);
+
+    /* 5. Bochs/older QEMU legacy shutdown string */
     const char *s = "Shutdown";
     while (*s) { outb(0x8900, (uint8_t)*s); s++; }
     outb(0x8900, 0);
 
-    /* 5. Last resort: triple fault via zero-length IDTR.
-     * FIX: struct must be __packed__ — without it, the compiler inserts 6
-     * bytes of padding between lim(2B) and base(8B), making sizeof=16 instead
-     * of the required 10 bytes.  LIDT with wrong size loads garbage → #GP. */
-    kinfo("POWER: ACPI ports did not respond — forcing triple fault\n");
-    static volatile struct __attribute__((packed)) {
-        uint16_t lim;
-        uint64_t base;
-    } zero_idt = { 0, 0 };
-    __asm__ volatile (
-        "lidt %0\n"
-        "int $3\n"
-        :: "m"(zero_idt)
-    );
+    /* 6. VMware: write magic to port 0x5658 (VMWARE_MAGIC) */
+    outl(0x5658, 0x564D5868UL);  /* VMware backdoor magic */
 
+    /* 7. Last resort: triple fault */
+    kinfo("POWER: all ACPI ports exhausted — forcing triple fault\n");
+    static volatile struct __attribute__((packed)) {
+        uint16_t lim; uint64_t base;
+    } zero_idt = { 0, 0 };
+    __asm__ volatile ("lidt %0\n int $3\n" :: "m"(zero_idt));
     for (;;) __asm__ volatile ("hlt");
 }
 

@@ -25,6 +25,8 @@
 #include "linux_memory.h"
 #include "include-uapi/asm-generic/fcntl.h"
 #include "include-uapi/asm-generic/errno.h"
+#include "../uaccess.h"
+#include "../mm/vmm.h"
 
 /* ---- helpers ------------------------------------------------------------ */
 
@@ -46,23 +48,34 @@ int32_t lx_sys_read(struct isr_frame *frame) {
     char       *buf = (char *)(uintptr_t)A2;
     uint32_t    len = A3;
 
-    if (!buf) return -EFAULT;
+    /* Validate user pointer before touching user memory */
+    if (!buf || !access_ok(buf, len)) return -EFAULT;
+
     if (fd == 0) {
-        /* stdin — read from keyboard */
+        /* stdin — read from keyboard into kernel buffer, then copy to user */
+        char kbuf[256];
         uint32_t i;
-        for (i = 0; i < len; i++) {
-            int c = keyboard_read();   /* FIX A2: int not char — KB_KEY_* >= 0x80 must not sign-extend */
-            buf[i] = c;
+        uint32_t chunk = len < sizeof(kbuf) ? len : (uint32_t)sizeof(kbuf);
+        for (i = 0; i < chunk; i++) {
+            int c = keyboard_read();
+            kbuf[i] = (char)c;
             vga_putchar(c);
             if (c == '\n') { i++; break; }
         }
+        if (copy_to_user(buf, kbuf, i) != 0) return -EFAULT;
         return (int32_t)i;
     }
     vfs_node_t *node = lx_fd_get(curtask(), fd);
     if (!node) return -EBADF;
 
-    /* Use an offset stored... we don't track per-fd offset yet; read from 0 */
-    int n = vfs_read(node, 0, len, (uint8_t *)buf);
+    /* Read into kernel buffer, then copy to user */
+    uint8_t *kbuf = (uint8_t *)kmalloc(len);
+    if (!kbuf) return -ENOMEM;
+    int n = vfs_read(node, 0, len, kbuf);
+    if (n > 0 && copy_to_user(buf, kbuf, (size_t)n) != 0) {
+        kfree(kbuf); return -EFAULT;
+    }
+    kfree(kbuf);
     return (n < 0) ? -EIO : n;
 }
 
@@ -72,14 +85,31 @@ int32_t lx_sys_write(struct isr_frame *frame) {
     const char  *buf = (const char *)(uintptr_t)A2;
     uint32_t     len = A3;
 
-    if (!buf) return -EFAULT;
+    /* Validate user pointer */
+    if (!buf || !access_ok(buf, len)) return -EFAULT;
+
     if (fd == 1 || fd == 2) {
-        for (uint32_t i = 0; i < len; i++) vga_putchar(buf[i]);
+        /* Copy from user into kernel buffer before touching bytes */
+        char kbuf[256];
+        uint32_t off = 0;
+        while (off < len) {
+            uint32_t chunk = (len - off) < sizeof(kbuf)
+                             ? (len - off) : (uint32_t)sizeof(kbuf);
+            if (copy_from_user(kbuf, buf + off, chunk) != 0) return -EFAULT;
+            for (uint32_t i = 0; i < chunk; i++) vga_putchar(kbuf[i]);
+            off += chunk;
+        }
         return (int32_t)len;
     }
     vfs_node_t *node = lx_fd_get(curtask(), fd);
     if (!node) return -EBADF;
-    int n = vfs_write(node, 0, len, (const uint8_t *)buf);
+
+    /* Copy from user then write to VFS */
+    uint8_t *kbuf = (uint8_t *)kmalloc(len);
+    if (!kbuf) return -ENOMEM;
+    if (copy_from_user(kbuf, buf, len) != 0) { kfree(kbuf); return -EFAULT; }
+    int n = vfs_write(node, 0, len, kbuf);
+    kfree(kbuf);
     return (n < 0) ? -EIO : (int32_t)len;
 }
 

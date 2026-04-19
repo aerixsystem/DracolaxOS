@@ -13,9 +13,10 @@
  * Commands used:
  *   GETVERSION  (0x0A) — sanity check: EAX must still be VMWARE_MAGIC
  *   ABSPTR_CMD  (0x27) — sub-commands for absolute pointer:
- *       sub 0x45414552 = ABSPTR_DATA   (get queued packet count)
- *       sub 0x53454552 = ABSPTR_STATUS (read one absolute packet)
- *       sub 0x00000000 = ABSPTR_OLD    (disable absolute mode)
+ *       sub 0x45414552 = ABSPTR_ENABLE  (enable absolute pointer mode)
+ *       sub 0x53454552 = ABSPTR_STATUS  (query pending packet count → EBX)
+ *       sub 0x4C425244 = ABSPTR_DATA    (read one abs packet: EBX=X/Y ECX=btns)
+ *       sub 0x00000000 = ABSPTR_OLD     (disable / revert to relative)
  *
  * Absolute packet fields (EBX after ABSPTR_DATA):
  *   bits 31-16: Y  (0–0xFFFF)
@@ -40,9 +41,22 @@
 #define VMWARE_CMD_GETVER   0x0Au
 #define VMWARE_CMD_ABSPTR   0x27u
 
-#define ABSPTR_ENABLE   0x45414552u   /* sub-command: request absolute data */
-#define ABSPTR_RELATIVE 0x46524552u   /* sub-command: back to relative      */
-#define ABSPTR_DATA     0x53454552u   /* sub-command: read one abs packet    */
+/* VMware absolute pointer sub-commands (cmd 0x27):
+ *   ABSPTR_ENABLE  (0x45414552) — enable absolute mode
+ *   ABSPTR_STATUS  (0x53454552) — query pending packet count (EBX = count)
+ *   ABSPTR_DATA    (0x4C425244) — read one packet: EBX[15:0]=X EBX[31:16]=Y ECX[2:0]=buttons
+ *   ABSPTR_OLD     (0x00000000) — disable / revert to relative
+ *
+ * BUG FIX: the previous code used ABSPTR_STATUS for BOTH the count check AND
+ * the data read.  STATUS returns the queue depth in EBX and nothing in ECX,
+ * so ECX bits[2:0] were always 0 → mouse_set_buttons(0) on every event →
+ * mbuttons never set → mouse_btn_pressed() always 0 → no clicks registered.
+ * The fix is to use the distinct ABSPTR_DATA sub-command for the second call.
+ */
+#define ABSPTR_ENABLE   0x45414552u   /* enable absolute mode              */
+#define ABSPTR_RELATIVE 0x46524552u   /* revert to relative mode           */
+#define ABSPTR_STATUS   0x53454552u   /* query pending packet count        */
+#define ABSPTR_DATA     0x4C425244u   /* read one absolute data packet     */
 
 /* ---- state --------------------------------------------------------------- */
 static int vm_active = 0;
@@ -129,25 +143,35 @@ extern void mouse_set_buttons(uint8_t b);
 void vmmouse_poll(void) {
     if (!vm_active || !fb.available) return;
 
-    /* Read pending packet count */
-    vmcall_t status = vmware_call(VMWARE_CMD_ABSPTR, ABSPTR_DATA);
+    /* Query how many absolute packets are waiting (STATUS sub-command).
+     * EBX on return = pending packet count.
+     *
+     * BUG FIX (right-click / stale buttons): previously only ONE packet was
+     * consumed per frame.  If two or more packets arrived (e.g. move + button
+     * release) the button state from the intermediate packet was never applied,
+     * causing mouse_btn_pressed() to mis-fire or miss events entirely.
+     * Drain ALL pending packets; the LAST one's position+buttons are current. */
+    vmcall_t status = vmware_call(VMWARE_CMD_ABSPTR, ABSPTR_STATUS);
     uint32_t count = status.ebx;
     if (count == 0) return;
 
-    /* Read the absolute position packet */
-    vmcall_t pkt = vmware_call(VMWARE_CMD_ABSPTR, ABSPTR_DATA);
+    /* Clamp drain count to avoid a hang if firmware reports a bogus large value */
+    if (count > 32) count = 32;
 
-    /* EBX bits[15:0]  = X in range 0–0xFFFF
-     * EBX bits[31:16] = Y in range 0–0xFFFF
-     * ECX bits[2:0]   = buttons (L=1 R=2 M=4) */
-    uint32_t abs_x = pkt.ebx & 0xFFFFu;
-    uint32_t abs_y = (pkt.ebx >> 16) & 0xFFFFu;
-    uint8_t  btns  = (uint8_t)(pkt.ecx & 0x07u);
+    int      sx_last = -1, sy_last = -1;
+    uint8_t  btns_last = 0;
 
-    /* Scale 0–0xFFFF to screen pixels */
-    int sx = (int)(abs_x * (fb.width  - 1) / 0xFFFFu);
-    int sy = (int)(abs_y * (fb.height - 1) / 0xFFFFu);
+    for (uint32_t i = 0; i < count; i++) {
+        vmcall_t pkt = vmware_call(VMWARE_CMD_ABSPTR, ABSPTR_DATA);
+        uint32_t abs_x = pkt.ebx & 0xFFFFu;
+        uint32_t abs_y = (pkt.ebx >> 16) & 0xFFFFu;
+        btns_last = (uint8_t)(pkt.ecx & 0x07u);
+        sx_last = (int)(abs_x * (fb.width  - 1) / 0xFFFFu);
+        sy_last = (int)(abs_y * (fb.height - 1) / 0xFFFFu);
+    }
 
-    mouse_set_pos(sx, sy);
-    mouse_set_buttons(btns);
+    if (sx_last >= 0) {
+        mouse_set_pos(sx_last, sy_last);
+        mouse_set_buttons(btns_last);
+    }
 }

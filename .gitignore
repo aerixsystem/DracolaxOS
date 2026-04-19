@@ -1,8 +1,8 @@
 *.o
 *.bin
 *.iso
+build/
 *.log
 *.txt
 *updates/
 *.zip
-*.elf

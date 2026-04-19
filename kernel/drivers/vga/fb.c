@@ -415,6 +415,37 @@ void fb_rounded_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
     }
 }
 
+/* fb_rounded_outline — draws ONLY the 1-pixel border ring of a rounded rect.
+ * Unlike fb_rounded_rect (solid fill), this leaves the interior untouched.
+ * Use this for window borders, focus rings, and UI outlines. */
+void fb_rounded_outline(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                         uint32_t r, uint32_t color) {
+    if (!fb.available || w == 0 || h == 0) return;
+    if (r > w / 2) r = w / 2;
+    if (r > h / 2) r = h / 2;
+
+    /* Straight edges */
+    if (w > 2 * r) {
+        fb_fill_rect(x + r, y,         w - 2*r, 1, color);
+        fb_fill_rect(x + r, y + h - 1, w - 2*r, 1, color);
+    }
+    if (h > 2 * r) {
+        fb_fill_rect(x,         y + r, 1, h - 2*r, color);
+        fb_fill_rect(x + w - 1, y + r, 1, h - 2*r, color);
+    }
+
+    /* Rounded corner arcs (1px each) */
+    int ir = (int)r;
+    for (int dy = 0; dy < ir; dy++) {
+        int dx = 0;
+        while ((dx+1)*(dx+1) + (ir-1-dy)*(ir-1-dy) <= ir*ir) dx++;
+        fb_put_pixel(x + r - 1 - dx,   y + (uint32_t)dy,          color);
+        fb_put_pixel(x + w - r + dx,   y + (uint32_t)dy,          color);
+        fb_put_pixel(x + r - 1 - dx,   y + h - 1 - (uint32_t)dy,  color);
+        fb_put_pixel(x + w - r + dx,   y + h - 1 - (uint32_t)dy,  color);
+    }
+}
+
 /* ---- Scaled character/string rendering ---------------------------------- */
 /* Renders the embedded 8x16 bitmap font at an integer scale factor.
  * scale=1 → 8×16px, scale=2 → 16×32px, scale=3 → 24×48px, etc.
@@ -460,9 +491,20 @@ void fb_print_s(uint32_t x, uint32_t y, const char *s,
  * klog/serial-mirror writes do not corrupt the GUI frame mid-draw. */
 
 static int kcon_locked = 0;   /* 0 = console active, 1 = suppressed */
+static int kcon_batch  = 0;   /* 1 = batch mode: suppress auto-flip inside print */
 
 void fb_console_lock(int lock)   { kcon_locked = lock; }
 int  fb_console_is_locked(void)  { return kcon_locked; }
+
+/* Batch mode: wrap multiple fb_console_print calls so that intermediate
+ * flips are suppressed.  Call begin before the batch, end after — end
+ * does the single flip that makes the whole batch visible at once.
+ * Used by shell readline REDRAW to avoid ~40 fb_flip calls per backspace. */
+void fb_console_begin_batch(void) { kcon_batch = 1; }
+void fb_console_end_batch(void) {
+    kcon_batch = 0;
+    if (fb_use_shadow && fb_shadow) fb_flip();
+}
 
 #define KCON_COLS  (fb.width  / 8)
 #define KCON_ROWS  (fb.height / 16)
@@ -558,9 +600,9 @@ void fb_console_print(const char *s, uint32_t fg) {
         }
         s++;
     }
-    /* FIX B: In text/shell mode the desktop never calls fb_flip(), so draws
-     * to the shadow buffer are invisible.  Auto-flip here whenever the console
-     * owns the shadow (kcon_locked == 0 guarantees the desktop is not active). */
-    if (fb_use_shadow && fb_shadow) fb_flip();
+    /* In batch mode, suppress the flip — the caller (e.g. shell REDRAW) will
+     * call fb_console_end_batch() which does a single flip for the whole batch.
+     * Outside batch mode, auto-flip so characters appear immediately. */
+    if (!kcon_batch && fb_use_shadow && fb_shadow) fb_flip();
 }
 

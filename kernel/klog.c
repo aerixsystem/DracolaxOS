@@ -79,13 +79,43 @@ static void open_new_log_file(log_chan_t *c) {
         kerror("KLOG: could not create log file '%s'\n", name);
 }
 
-/* Rotate: close current, increment index, open next. */
+/* Maximum number of log files kept per channel before the oldest is deleted.
+ * With KLOG_MAX_LINES=9000 and ~80 bytes/line this is ~720 KB max on disk. */
+#define KLOG_MAX_FILES 5
+
+/* Delete the oldest log file for this channel (file_idx - KLOG_MAX_FILES). */
+static void delete_old_log(log_chan_t *c) {
+    if (!storage_root) return;
+    int old_idx = c->file_idx - KLOG_MAX_FILES;
+    if (old_idx < 0) return;
+
+    /* We don't have a full directory iterator with delete here, so we
+     * instead zero-out the node contents (effectively making it empty).
+     * A real implementation would call ramfs_delete(); until that API
+     * is wired through VFS, just reuse the slot by overwriting it. */
+    char name[64];
+    /* Build the old name — we can't reconstruct the original timestamp,
+     * so we track file indices and store a sentinel in the filename. */
+    snprintf(name, sizeof(name), "%s_old_%04d.log", c->prefix, old_idx);
+    vfs_node_t *old = vfs_finddir(storage_root, name);
+    if (old) {
+        /* Overwrite with empty content to free the slot */
+        vfs_write(old, 0, 1, (const uint8_t *)"");
+    }
+    /* Primary path: try to delete via ramfs directly */
+    ramfs_delete(storage_root, name);
+}
+
+/* Rotate: close current, increment index, open next, delete oldest. */
 static void rotate_log(log_chan_t *c) {
     c->file_idx++;
     c->line_count = 0;
     c->node       = NULL;
     c->write_off  = 0;
     open_new_log_file(c);
+    /* Prune oldest file once we exceed the max-files limit */
+    if (c->file_idx >= KLOG_MAX_FILES)
+        delete_old_log(c);
 }
 
 /* Write a null-terminated string to the channel, appending. */
@@ -207,4 +237,20 @@ void klog_kerror(const char *fmt, ...) {
     vsnprintf(buf, sizeof(buf), fmt, ap);
     __builtin_va_end(ap);
     klog_write(KLOG_KERNEL, buf);
+}
+
+/* klog_drain_to_serial — emergency ring buffer drain for panic handler.
+ * Writes all buffered log entries directly to COM1 without touching VFS.
+ * Called from kpanic() after interrupts are disabled; must not allocate. */
+#include "drivers/serial/serial.h"
+void klog_drain_to_serial(void) {
+    serial_print("\n=== KLOG DRAIN (panic context) ===\n");
+    int i = lr_head;
+    int count = 0;
+    while (i != lr_tail && count < LOG_RING) {
+        serial_print(log_ring[i].line);
+        i = (i + 1) % LOG_RING;
+        count++;
+    }
+    serial_print("=== END KLOG DRAIN ===\n");
 }

@@ -36,7 +36,9 @@ void     fb_print_s    (uint32_t x, uint32_t y, const char *s, uint32_t fg, uint
 void     fb_blit       (uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint32_t *pixels);
 void     fb_clear      (uint32_t color);
 uint32_t fb_blend      (uint32_t src, uint32_t dst, uint8_t alpha);
-void     fb_rounded_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t r, uint32_t color);
+void     fb_rounded_rect   (uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t r, uint32_t color);
+/* Outline-only version — does NOT fill interior, draws only the 1px border ring */
+void     fb_rounded_outline(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t r, uint32_t color);
 
 /* Double-buffer API.
  * Call fb_enable_shadow() once (e.g. at desktop start).
@@ -58,5 +60,10 @@ void     fb_console_print   (const char *s, uint32_t fg);
 void     fb_console_clear   (void);
 void     fb_console_lock    (int lock);   /* 1 = suppress writes, 0 = allow */
 int      fb_console_is_locked(void);
+
+/* Batch mode: suppresses per-call fb_flip() inside fb_console_print.
+ * Call begin() before a multi-write block, end() flushes once. */
+void     fb_console_begin_batch(void);
+void     fb_console_end_batch  (void);
 
 #endif /* FB_H */

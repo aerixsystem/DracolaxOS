@@ -8,6 +8,8 @@
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "sched/sched.h"
+#include "bootmode.h"
+#include "klog.h"
 
 static const char *level_prefix[] = {
     "[INFO ] ", "[WARN ] ", "[ERROR] ", "[DEBUG] "
@@ -30,19 +32,30 @@ void printk(int level, const char *fmt, ...) {
     vsnprintf(buf + n, sizeof(buf) - (size_t)n, fmt, ap);
     va_end(ap);
 
-    vga_set_color(level_fg[level & 3], VGA_BLACK);
-    vga_print(buf);
-    vga_set_color(VGA_LIGHT_GREY, VGA_BLACK);
-
+    /* Always write to serial — available in all modes */
     serial_print(buf);
 
-    /* FIX: Guard fb_console_print() with is_locked() so that when the
-     * desktop owns the shadow buffer (kcon_locked=1) printk() does not
-     * attempt to draw into the GUI framebuffer.  The internal check inside
-     * fb_console_print() is a safety net; this outer guard avoids the call
-     * overhead entirely in the hot path (every kinfo/kdebug during desktop). */
-    if (fb.available && !fb_console_is_locked())
-        fb_console_print(buf, level_fb_fg[level & 3]);
+    /* Always enqueue to klog ring — klog_flush_task persists to storage */
+    klog_write(KLOG_KERNEL, buf);
+
+    /* In GRAPHICAL/AUTO mode: VGA text is invisible (pixel fb owns the
+     * display). Only write to fb_console if not locked by the desktop. */
+    if (bootmode_wants_desktop()) {
+        if (fb.available && !fb_console_is_locked())
+            fb_console_print(buf, level_fb_fg[level & 3]);
+        return;
+    }
+
+    /* SHELL / TEXT modes: ALL log output goes to the klog file only.
+     * DO NOT write to VGA text buffer — the shell owns that display and
+     * stray kernel messages would corrupt its output mid-command.
+     * The exception is ERROR level which is always shown. */
+    if ((level & 3) == LOG_ERROR) {
+        vga_set_color(level_fg[level & 3], VGA_BLACK);
+        vga_print(buf);
+        vga_set_color(VGA_LIGHT_GREY, VGA_BLACK);
+    }
+    /* INFO / WARN / DEBUG: silently captured to klog file, not screen */
 }
 
 /* ---- Kernel panic screen ------------------------------------------------ */
@@ -77,18 +90,41 @@ static void kp_print_hex(uint8_t x, uint8_t y, uint64_t v, uint16_t attr) {
 void kpanic(const char *msg) {
     __asm__ volatile ("cli");
 
-    uint16_t red_hdr  = kp_attr(VGA_WHITE,      VGA_RED);
-    uint16_t red_body = kp_attr(VGA_LIGHT_RED,  VGA_RED);
-    uint16_t red_dim  = kp_attr(VGA_BROWN,       VGA_RED);
+    /* ── Capture all GP registers immediately ── */
+    uint64_t reg_rax, reg_rbx, reg_rcx, reg_rdx;
+    uint64_t reg_rsi, reg_rdi, reg_rbp, reg_rsp;
+    uint64_t reg_r8,  reg_r9,  reg_r10, reg_r11;
+    uint64_t reg_r12, reg_r13, reg_r14, reg_r15;
+    uint64_t reg_rip, reg_rflags;
 
-    /* Fill entire screen red */
+    __asm__ volatile (
+        "mov %%rax, %0\n"  "mov %%rbx, %1\n"
+        "mov %%rcx, %2\n"  "mov %%rdx, %3\n"
+        "mov %%rsi, %4\n"  "mov %%rdi, %5\n"
+        "mov %%rbp, %6\n"  "mov %%rsp, %7\n"
+        "mov %%r8,  %8\n"  "mov %%r9,  %9\n"
+        "mov %%r10, %10\n" "mov %%r11, %11\n"
+        "mov %%r12, %12\n" "mov %%r13, %13\n"
+        "mov %%r14, %14\n" "mov %%r15, %15\n"
+        "lea (%%rip), %16\n"
+        "pushfq\n" "pop %17\n"
+        : "=m"(reg_rax), "=m"(reg_rbx), "=m"(reg_rcx), "=m"(reg_rdx),
+          "=m"(reg_rsi), "=m"(reg_rdi), "=m"(reg_rbp), "=m"(reg_rsp),
+          "=m"(reg_r8),  "=m"(reg_r9),  "=m"(reg_r10), "=m"(reg_r11),
+          "=m"(reg_r12), "=m"(reg_r13), "=m"(reg_r14), "=m"(reg_r15),
+          "=r"(reg_rip), "=r"(reg_rflags)
+        :: "memory"
+    );
+
+    uint16_t red_hdr  = kp_attr(VGA_WHITE,     VGA_RED);
+    uint16_t red_body = kp_attr(VGA_LIGHT_RED, VGA_RED);
+    uint16_t red_dim  = kp_attr(VGA_BROWN,      VGA_RED);
+
     for (uint8_t y = 0; y < KPANIC_SROWS; y++) kp_fill(y, ' ', red_body);
 
-    /* Row 0: header */
     kp_fill(0, ' ', red_hdr);
     kp_print(2, 0, "DRACOLAX OS  ***  KERNEL PANIC  ***", red_hdr);
 
-    /* Row 2-6: reason (wrap at 76 chars) */
     kp_print(2, 2, "REASON:", red_hdr);
     uint8_t rx = 10, ry = 2;
     for (const char *p = msg; *p; p++) {
@@ -96,58 +132,51 @@ void kpanic(const char *msg) {
         if (*p != '\n') kp_put(rx++, ry, *p, red_body);
     }
 
-    /* Row 8: separator */
     for (uint8_t x = 2; x < 78; x++) kp_put(x, 8, '-', red_dim);
+    kp_print(2, 9, "REGISTERS:", red_hdr);
 
-    /* Row 9: debug info header */
-    kp_print(2, 9, "DEBUG INFORMATION:", red_hdr);
+    struct { const char *name; uint64_t val; } regs[] = {
+        {"RAX", reg_rax}, {"RBX", reg_rbx},
+        {"RCX", reg_rcx}, {"RDX", reg_rdx},
+        {"RSI", reg_rsi}, {"RDI", reg_rdi},
+        {"RBP", reg_rbp}, {"RSP", reg_rsp},
+        {"R8 ", reg_r8 }, {"R9 ", reg_r9 },
+        {"R10", reg_r10}, {"R11", reg_r11},
+        {"R12", reg_r12}, {"R13", reg_r13},
+        {"R14", reg_r14}, {"R15", reg_r15},
+        {"RIP", reg_rip}, {"RFL", reg_rflags},
+    };
+    for (int ri = 0; ri < 18; ri++) {
+        uint8_t col = (ri & 1) ? 40u : 2u;
+        uint8_t row = (uint8_t)(10 + ri / 2);
+        if (row >= 19) break;
+        kp_print(col, row, regs[ri].name, red_body);
+        kp_put((uint8_t)(col + 3), row, ':', red_body);
+        kp_print_hex((uint8_t)(col + 5), row, regs[ri].val, red_body);
+    }
 
-    /* RIP via call+pop trick */
-    uint64_t rip = 0;
-    __asm__ volatile ("lea (%%rip), %0" : "=r"(rip));
-    kp_print(2,  10, "RIP  :", red_body);
-    kp_print_hex(10, 10, rip, red_body);
+    for (uint8_t x = 2; x < 78; x++) kp_put(x, 19, '-', red_dim);
 
-    uint64_t rsp = 0;
-    __asm__ volatile ("mov %%rsp, %0" : "=r"(rsp));
-    kp_print(2,  11, "RSP  :", red_body);
-    kp_print_hex(10, 11, rsp, red_body);
-
-    /* Memory info */
     uint32_t free_kb = pmm_free_pages() * 4;
     uint32_t used_kb = pmm_used_pages() * 4;
+    (void)used_kb;  /* computed for completeness; displayed via free_kb */
     char tmp[16]; tmp[15] = '\0';
     int i, digits;
-
-    kp_print(2, 12, "RAM  : free=", red_body);
+    kp_print(2, 20, "RAM free=", red_body);
     uint32_t v = free_kb; digits = 0;
-    if (!v) { tmp[14]='0'; digits=1; } else { i=14; while(v){tmp[i--]='0'+(v%10);v/=10;digits++;} }
-    kp_print(14, 12, tmp + 15 - digits, red_body);
-    kp_print(14 + (uint8_t)digits, 12, " KB", red_body);
-
-    kp_print(20, 12, "used=", red_body);
-    v = used_kb; digits = 0;
-    if (!v) { tmp[14]='0'; digits=1; } else { i=14; while(v){tmp[i--]='0'+(v%10);v/=10;digits++;} }
-    kp_print(25, 12, tmp + 15 - digits, red_body);
-    kp_print(25 + (uint8_t)digits, 12, " KB", red_body);
-
-    kp_print(2, 13, "TASKS:", red_body);
+    if (!v){tmp[14]='0';digits=1;}else{i=14;while(v){tmp[i--]='0'+(v%10);v/=10;digits++;}}
+    kp_print(11, 20, tmp + 15 - digits, red_body);
+    kp_print((uint8_t)(11+(uint8_t)digits), 20, "KB  tasks=", red_body);
     int tc = sched_task_count();
-    tmp[15]='\0'; i=14;
-    uint32_t uv = (uint32_t)(tc < 0 ? 0 : tc);
-    if (!uv){tmp[14]='0';}
-    else{while(uv){tmp[i--]='0'+(uv%10);uv/=10;i=i<0?0:i;}}
-    kp_print(9, 13, tmp + 14 - (tc>9?1:0), red_body);
+    uint32_t uv = (uint32_t)(tc < 0 ? 0 : tc); digits = 0;
+    if (!uv){tmp[14]='0';digits=1;}else{i=14;while(uv){tmp[i--]='0'+(uv%10);uv/=10;digits++;}}
+    kp_print((uint8_t)(23+(uint8_t)digits), 20, tmp + 15 - digits, red_body);
 
-    /* Row 15: separator */
-    for (uint8_t x = 2; x < 78; x++) kp_put(x, 15, '-', red_dim);
+    kp_fill((uint8_t)(KPANIC_SROWS - 1), ' ', red_hdr);
+    kp_print(2, (uint8_t)(KPANIC_SROWS - 1),
+             "System halted. Check serial (COM1) for full dump.", red_hdr);
 
-    kp_print(2, 16, "WHAT TO DO:", red_hdr);
-    kp_print(4, 17, "1. Note the REASON above.", red_body);
-    kp_print(4, 18, "2. Check serial output (COM1) for full debug log.", red_body);
-    kp_print(4, 19, "3. Report at: github.com/lunax/dracolaxos/issues", red_body);
-
-    /* Also show on FB if available */
+    /* Framebuffer fallback */
     if (fb.available) {
         fb_fill_rect(0, 0, fb.width, fb.height, 0x1A0000u);
         fb_fill_rect(0, 0, fb.width, 32, 0xCC0000u);
@@ -160,13 +189,29 @@ void kpanic(const char *msg) {
             "System halted. Power off and restart.", 0xFF8888u, 0x440000u);
     }
 
+    /* Full serial register dump */
     serial_print("\n\n=== KERNEL PANIC ===\nREASON: ");
     serial_print(msg);
-    serial_print("\n");
+    serial_print("\n--- REGISTERS ---\n");
+    for (int ri = 0; ri < 18; ri++) {
+        serial_print(regs[ri].name);
+        serial_print(": 0x");
+        char hbuf[18]; hbuf[16] = '\n'; hbuf[17] = '\0';
+        uint64_t hv = regs[ri].val;
+        for (int hi = 15; hi >= 0; hi--) {
+            uint8_t nibble = (uint8_t)(hv & 0xF);
+            hbuf[hi] = nibble < 10 ? '0' + nibble : 'A' + nibble - 10;
+            hv >>= 4;
+        }
+        serial_print(hbuf);
+    }
+    serial_print("=== END PANIC ===\n");
 
-    /* Bottom bar */
-    kp_fill(KPANIC_SROWS - 1, ' ', red_hdr);
-    kp_print(2, KPANIC_SROWS - 1, "System halted. Power off and restart.", red_hdr);
+    /* Drain the klog ring buffer to serial so crash context is preserved.
+     * klog_flush() writes to VFS which may be unavailable; we do a raw
+     * ring-buffer drain here instead using the klog emergency drain. */
+    extern void klog_drain_to_serial(void);
+    klog_drain_to_serial();
 
     for (;;) __asm__ volatile ("hlt");
 }

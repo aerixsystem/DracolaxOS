@@ -158,3 +158,194 @@ cursor_move()           → VRAM: cursor stamped after flip
 - Added `#define offsetof(type, member) __builtin_offsetof(type, member)` (no `<stddef.h>` available under `-nostdinc`).
 - Replaced `(uint64_t *)(void *)&_t->rsp0` with `(uint64_t *)(void *)((char *)_t + offsetof(tss64_t, rsp0))`.
 - `char *` arithmetic is allowed to alias any object; the pointer value is identical but derived without taking the address of a packed member. Warning is gone, no behaviour change on x86.
+
+
+---
+
+## Phase 2 — .dxi Icon System (completed)
+
+### New files
+
+| File | Purpose |
+|------|---------|
+| `kernel/dxi/dxi.h` | Format spec struct, `dxi_icon_t`, `dxi_load()` prototype, constants |
+| `kernel/dxi/dxi.c` | VFS-backed loader, header validation, lazy pixel allocation |
+| `tools/dxi-convert/dxi_convert.c` | Host-side C converter: PNG/JPG → .dxi via stb_image |
+| `tools/dxi-convert/Makefile` | Builds `dxi_convert`, auto-downloads stb_image.h |
+
+### Changed files
+
+| File | Change |
+|------|--------|
+| `kernel/init.c` | Added `/storage/main/system/shared/images` RAMFS mount (icon store) |
+| `gui/compositor/compositor.h` | Added `blit_icon_bgra()` prototype |
+| `gui/compositor/compositor.c` | Implemented `blit_icon_bgra()` — per-pixel BGRA alpha blend, integer math, A=255/0 fast paths |
+| `gui/desktop/default-desktop/desktop.c` | Added `dxi.h` include, icon cache state (`g_icons[]`, `g_icon_pixels[]`), `icons_load_all()`, `app_name_to_dxi()`, `blit_icon_bgra()` call in start menu renderer |
+| `Makefile` | Added `-Ikernel/dxi` include path, `kernel/dxi/dxi.c` to `KERNEL_CORE` sources |
+| `docs/DXI_FORMAT.md` | Fully rewritten to match implemented spec |
+
+### Design decisions
+
+**Fixed pixel storage, not per-icon kmalloc:**  
+`g_icon_pixels[APP_MAX][48×48]` is a static array in `.bss`. Total: 16 × 9216 = 144 KB. This avoids fragmentation from 16 small separate `kmalloc` calls, and the desktop loop never touches the allocator per frame.
+
+**Caller-supplied buffer:**  
+`dxi_load()` checks `icon->pixels` before allocating. The desktop pre-fills `g_icons[i].pixels = g_icon_pixels[i]` before calling `dxi_load()`, so the loader writes directly into the static array. `dxi_free()` will not free a caller-supplied buffer.
+
+**Graceful fallback:**  
+If a `.dxi` file is missing (`dxi_load()` returns -1), `g_icons[i].loaded` stays 0. `draw_start_menu()` falls back to two-character text initials — the start menu remains fully functional without any icons installed.
+
+**Icon naming:**  
+App name → filename via `app_name_to_dxi()`: lowercase, spaces become hyphens, `.dxi` appended. Deterministic and requires no manifest/registry.
+
+**`blit_icon_bgra()` does not call `fb_put_pixel()`:**  
+It writes directly into `fb_shadow_ptr()` via pointer arithmetic — one array write per opaque pixel instead of a function call with bounds checks per pixel. Clipping is done once per row at the top of the function.
+
+**`comp_render()` no longer draws background/dock/topbar:**  
+This was the root cause of the dock-button bug fixed in the previous session. `comp_render()` now renders only compositor window backbufs; `blit_icon_bgra()` is called from the desktop loop (inside `draw_start_menu()`) which already owns the shadow buffer.
+
+### How to add icons
+
+```bash
+cd tools/dxi-convert
+make                                          # build converter + download stb
+./dxi_convert my-icon.png terminal.dxi 48 48  # convert at dock size
+cp terminal.dxi ../../storage/main/system/images/icons/
+```
+
+Rebuild and boot — `icons_load_all()` picks them up automatically.
+
+
+---
+
+## Phase X — Kernel Hardening (completed)
+
+### Build warnings fixed
+
+**WARNING: `render_dock` and `render_topbar` defined but not used (`compositor.c`)**
+Both functions were dead code left over from the Phase 1 comp_render cleanup. Removed entirely. The desktop task owns dock and topbar rendering; the compositor only touches window backbufs.
+
+### Hardening audit — what already existed
+
+The kernel had more hardening than the checklist assumed:
+- `kpanic()` fully implemented with VGA red screen, RIP/RSP dump, RAM stats, serial output, and framebuffer fallback — nothing to add.
+- Ring-buffer `klog` with two channels (kernel + system), async flush task, file rotation — nothing to add.
+- `kmalloc`/`kfree` already interrupt-safe via `pushfq/cli/popfq` around free-list operations.
+- ATA PIO driver already has bounded timeout loops (`for i < 1000000`) returning error codes — not infinite waits.
+- IRQ handlers already isolated from GUI code — no GUI calls inside interrupt context anywhere in the codebase.
+
+### New: `kernel/uaccess.h` — user/kernel boundary
+
+Every syscall that accepts a user pointer must validate it before touching. Previously `SYS_WRITE` and `SYS_READ` dereferenced `buf` directly — a malicious process could pass a kernel address and read/corrupt kernel memory.
+
+**`access_ok(ptr, n)`** — validates a pointer range against `[USER_MEM_START=0x1000, USER_MEM_END=0x7FFFFFFFFFFF]`. Rejects NULL, kernel addresses, and ranges that wrap around.
+
+**`copy_from_user(kdst, usrc, n)`** / **`copy_to_user(udst, ksrc, n)`** — safe copies with `access_ok` check before touching user memory.
+
+**`strncpy_from_user(kdst, usrc, maxlen)`** — NUL-safe string copy from user space, byte-at-a-time with upper-bound check.
+
+**`KASSERT(expr, msg)`** — triggers `kpanic()` with file:line in `DRACO_DEBUG` builds; compiles to nothing in release. Usage: `KASSERT(ptr != NULL, "sched_spawn: null entry");`
+
+**`SYSCALL_VALIDATE_PTR(ptr, len, frame)`** — one-liner macro for syscall handlers: calls `access_ok`, logs a warning, sets `frame->rax = -EFAULT`, and returns if invalid.
+
+`syscall.c` updated: `SYS_WRITE` and `SYS_READ` now call `access_ok` before touching user buffers, and copy through a kernel stack buffer to prevent TOCTOU between validation and use.
+
+### New: heap poisoning + double-free detection (`vmm.c`)
+
+**`free` flag replaced with `magic` field:**
+- `ALLOC_MAGIC = 0xDEADC0DE` — set when block is allocated
+- `FREE_MAGIC  = 0xFEEEFEEE` — set when block is freed
+
+**Double-free detection in `kfree()`:** if `h->magic == FREE_MAGIC`, the block was already freed. Logs `DOUBLE FREE detected` and returns without touching the free list (prevents list corruption).
+
+**Bad pointer detection:** if `h->magic` is neither `ALLOC_MAGIC` nor `FREE_MAGIC`, logs `bad magic — heap corrupt?` and returns.
+
+**Payload poisoning:** on free, `memset(ptr, 0xCC, payload_sz)` fills the block payload before returning it to the free list. Any code that reads from a freed pointer will get `0xCC` bytes, making use-after-free bugs immediately visible in the debugger.
+
+### New: `mem_check()` heap walker
+
+Walks every block in the heap from `heap_start` to `heap_end`, verifying `magic` is either `ALLOC_MAGIC` or `FREE_MAGIC`. Reports corrupt blocks via `kerror`. Returns count of corrupt blocks (0 = healthy).
+
+Available in the kernel shell: `memcheck`
+Available in code: `#include "mm/vmm.h"` then call `mem_check()`.
+
+### New: VFS path sanitisation (`vfs.c`, `vfs.h`)
+
+`vfs_path_sanitize(src, dst, dstsz)` normalises a path before it enters the mount resolver:
+1. Must start with `/`
+2. Collapses consecutive slashes
+3. Strips `.` components silently
+4. **REJECTS** `..` components — returns -1 and logs a warning
+
+`vfs_open()` now calls `vfs_path_sanitize()` first. Any `..` in a path from user space causes `vfs_open()` to return NULL rather than walking above the mount root. The old behaviour (`..` silently reset to the start node) was not a full fix — it allowed `/../../../etc/` to partially resolve depending on VFS structure.
+
+### New: `DRACO_DEBUG` build mode (`Makefile` v3.1)
+
+```bash
+make           # RELEASE: -O2, KASSERT = no-op
+make DEBUG=1   # DEBUG:   -O0 -g -DDRACO_DEBUG, KASSERT triggers kpanic
+```
+
+`DRACO_DEBUG` enables `KASSERT` expansion. The release build has zero overhead from assertions — they compile away completely via the preprocessor.
+
+
+---
+
+## Stability Phase — Kernel Stabilisation (completed)
+
+### Audit: what was already fully implemented
+
+The following checklist items required **no new code** — they were already correct:
+
+| Item | Where |
+|------|-------|
+| `kpanic()` — RIP/RSP/RAM dump, VGA red screen, serial output, halt | `kernel/log.c` |
+| Ring-buffer logger — 256-entry async, two channels (kernel/system), file rotation | `kernel/klog.c` |
+| No GUI code in interrupt context — IRQ handlers never call fb/wm/desktop | `kernel/arch/x86_64/irq.c` |
+| Watchdog task monitoring IRQ1/IRQ12, re-asserting stalled ports | `kernel/init.c::irq_watchdog_task` |
+| VFS `..` traversal blocking — `vfs_path_sanitize()` rejects any `..` component | `kernel/fs/vfs.c` |
+| ATA timeout loops — bounded `for i < 1000000` returning error codes, not infinite waits | `kernel/drivers/ata/ata_pio.c` |
+| `copy_from_user` / `copy_to_user` / `access_ok` / `KASSERT` | `kernel/uaccess.h` |
+| Header magic (`ALLOC_MAGIC`/`FREE_MAGIC`), double-free detection, payload poison (`0xCC`) | `kernel/mm/vmm.c` |
+| Tail canary (`TAIL_MAGIC = 0xCAFEBABE`) written by `kmalloc` | `kernel/mm/vmm.c` |
+
+### Fixed: tail canary was overflowing its block
+
+**Root cause:** `kmalloc` computed `need = ALIGN16(size) + HDR_SIZE`. The tail canary was written at `h + h->size - 4`, which is the last 4 bytes of the block — but with the old formula those 4 bytes overlapped the *start* of the next block's header, silently overwriting it.
+
+**Fix:** `need = ALIGN16(size + CANARY_SZ) + HDR_SIZE`. The canary now lives entirely within the block's own allocation, and `ALIGN16` ensures the next block header remains 16-byte aligned.
+
+### Fixed: `kfree` did not verify the tail canary
+
+**Fix:** `kfree` now calls `tail_ok(h)` before poisoning the payload. A corrupt canary at free time means a buffer overflow has already occurred — logged as `VMM: kfree: OVERFLOW detected`. The block is still freed (better a corrupt free than a permanent leak).
+
+### Fixed: `mem_check()` / `heap_check_all()` did not check tail canaries
+
+`mem_check()` previously only validated header magic. Now it also calls `tail_ok()` on every allocated block, catching overflows that happened between `kmalloc` and `mem_check`. Reports the address and block size of each corrupt block.
+
+`heap_check_all()` added as the canonical name matching the stability spec — it is a direct call to `mem_check()`.
+
+### Fixed: allocation tracking counters incomplete
+
+`g_total_frees` was never incremented. `g_current_used_bytes` was never decremented on free. Both are now updated in `kfree`. Four new accessor functions added to `vmm.h`: `vmm_alloc_count()`, `vmm_total_allocs()`, `vmm_total_frees()`, `vmm_peak_bytes()`. `mem_check()` now prints all four in its OK summary line.
+
+### Fixed: `panic()` alias missing
+
+`log.h` now defines `#define panic(msg) kpanic(msg)`. Both names invoke the same implementation. Code written to either style compiles without changes.
+
+### Fixed: Linux syscall layer dereferenced user pointers directly
+
+`linux_syscalls.c` was included in the uaccess-hardening of the Draco ABI layer but the Linux compat `lx_sys_read` and `lx_sys_write` still dereferenced `buf` directly:
+
+```c
+buf[i] = c;   // buf is a user pointer — never do this in Ring 0
+```
+
+**Fix:** `uaccess.h` included in `linux_syscalls.c`. Both `lx_sys_read` and `lx_sys_write` now:
+1. Call `access_ok(buf, len)` before touching user memory — reject with `-EFAULT` if invalid
+2. Copy through kernel stack or `kmalloc` buffers using `copy_from_user`/`copy_to_user`
+3. Never dereference user pointers from Ring 0
+
+### `vmm.h` rewritten
+
+The header had a corrupted include guard from a previous session (two `#endif` markers). Fully rewritten with a clean guard, complete API documentation, and all new symbols properly declared.

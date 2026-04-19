@@ -25,6 +25,16 @@
 #include "../services/audio_service.h"
 #include "lxs_kernel.h"
 #include "drivers/ata/ata_pio.h"
+#include "bootmode.h"   /* BUG FIX 5: needed for bootmode_wants_desktop() guard */
+#include "../gui/compositor/compositor.h"  /* comp_term_t for terminal output hook */
+
+/* Terminal output hook — when set, shell_print() writes to a compositor
+ * window instead of VGA/fb_console. Set by app_terminal before spawning
+ * the shell task so all shell output routes through the terminal window. */
+static comp_term_t *g_shell_term = NULL;
+
+void shell_attach_terminal(comp_term_t *t) { g_shell_term = t; }
+void shell_detach_terminal (void)           { g_shell_term = NULL; }
 
 /* shell_print — writes to VGA text buffer AND fb_console (pixel-mode shells).
  * In graphical mode GRUB leaves the display in pixel mode, so shell_print()
@@ -34,16 +44,47 @@
  * FIX: was calling itself (shell_print/shell_putchar) instead of vga_print/
  * vga_putchar — caused immediate infinite recursion → stack overflow →
  * triple fault → QEMU paused the VM on every keypress/output attempt. */
+/* shell_print / shell_putchar — output routing:
+ *
+ * SHELL / TEXT modes: the display is in VESA pixel mode (GRUB set gfxpayload).
+ *   VGA text at 0xB8000 is not visible. We route to fb_console_print() so
+ *   shell output appears on the pixel framebuffer. Kernel printk() is guarded
+ *   separately and does NOT call fb_console in these modes, so only shell
+ *   output reaches the pixel framebuffer — no kernel log bleed.
+ *
+ * GRAPHICAL mode: desktop owns the framebuffer and locks fb_console.
+ *   Shell output goes to VGA text (not visible on screen, but that is expected
+ *   in graphical mode — the GUI is the display). Serial always receives output. */
 static void shell_print(const char *s) {
-    vga_print(s);
-    if (fb.available) fb_console_print(s, 0xF0F0FFu);
     serial_print(s);
+    /* When a compositor terminal is attached, ALL output goes there.
+     * The window IS the display — skip VGA and fb_console entirely. */
+    if (g_shell_term) {
+        comp_win_term_print(g_shell_term, s);
+        return;
+    }
+    vga_print(s);
+    if (fb.available) {
+        if (!bootmode_wants_desktop())
+            fb_console_print(s, 0xF0F0FFu);
+        else if (!fb_console_is_locked())
+            fb_console_print(s, 0xF0F0FFu);
+    }
 }
 static void shell_putchar(char c) {
-    vga_putchar(c);
     char buf[2] = {c, 0};
-    if (fb.available) fb_console_print(buf, 0xF0F0FFu);
     serial_print(buf);
+    if (g_shell_term) {
+        comp_win_term_print(g_shell_term, buf);
+        return;
+    }
+    vga_putchar(c);
+    if (fb.available) {
+        if (!bootmode_wants_desktop())
+            fb_console_print(buf, 0xF0F0FFu);
+        else if (!fb_console_is_locked())
+            fb_console_print(buf, 0xF0F0FFu);
+    }
 }
 
 
@@ -99,94 +140,190 @@ static int shell_strstr(const char *h, const char *n) {
 
 /* ---- readline — with UP/DOWN history navigation ---- */
 static int readline(char *buf, int max) {
-    int pos     = 0;
-    int hist_idx = hist_count;   /* points past last entry = "new" line */
+    int pos      = 0;   /* cursor position within buf (0..len) */
+    int len      = 0;   /* total characters in buf             */
+    int hist_idx = hist_count;
     buf[0] = '\0';
 
-    /* saved partial line so UP/DOWN doesn't destroy what was being typed */
     char saved[LINE_MAX] = "";
 
-    /* Helper: redraw the current line content after cursor reposition.
-     * Erases current terminal line with '\r' + spaces, reprints prompt-less
-     * content. Works on both VGA text and fb_console. */
+    /* Redraw the input area from the current cursor position.
+     * BATCH MODE: all shell_putchar calls inside REDRAW are wrapped in
+     * fb_console_begin/end_batch so only ONE fb_flip() happens per redraw
+     * instead of ~40.  Without this, rapid backspacing stalls the system
+     * because each shell_putchar triggers a 3 MB shadow→VRAM copy. */
+    #define REDRAW() do { \
+        if (fb.available && !bootmode_wants_desktop()) fb_console_begin_batch(); \
+        for (int _i = 0; _i < pos; _i++) shell_putchar('\b'); \
+        for (int _i = 0; _i < len; _i++) shell_putchar((unsigned char)buf[_i]); \
+        shell_putchar(' '); shell_putchar('\b'); \
+        for (int _i = len; _i > pos; _i--) shell_putchar('\b'); \
+        if (fb.available && !bootmode_wants_desktop()) fb_console_end_batch(); \
+    } while (0)
+
     while (1) {
         int c = keyboard_read();
+        uint8_t uc = (uint8_t)c;
 
-        /* ── ENTER ────────────────────────────────────────────── */
+        /* ── ENTER ──────────────────────────────────────────────── */
         if (c == '\n' || c == '\r') {
+            /* Move cursor to end before newline so output starts fresh */
+            for (int i = pos; i < len; i++) shell_putchar((unsigned char)buf[i]);
             shell_putchar('\n');
-            buf[pos] = '\0';
-            if (pos > 0) {
-                /* Only store if different from last entry */
+            buf[len] = '\0';
+            if (len > 0) {
                 if (hist_count == 0 ||
                     strcmp(history[hist_count - 1], buf) != 0) {
                     if (hist_count < HIST_MAX)
                         strncpy(history[hist_count++], buf, LINE_MAX - 1);
                     else {
-                        /* Ring: shift out oldest */
                         for (int i = 0; i < HIST_MAX - 1; i++)
                             strncpy(history[i], history[i+1], LINE_MAX - 1);
                         strncpy(history[HIST_MAX-1], buf, LINE_MAX - 1);
                     }
                 }
             }
-            return pos;
+            return len;
         }
 
-        /* ── BACKSPACE ────────────────────────────────────────── */
+        /* ── BACKSPACE — delete char left of cursor ─────────────── */
         if (c == '\b') {
             if (pos > 0) {
+                /* Shift buf[pos..len-1] left by one */
+                for (int i = pos - 1; i < len - 1; i++)
+                    buf[i] = buf[i + 1];
+                len--;
                 pos--;
-                buf[pos] = '\0';
+                buf[len] = '\0';
+                shell_putchar('\b');
+                REDRAW();
+            }
+            continue;
+        }
+
+        /* ── DEL — delete char at cursor ─────────────────────────── */
+        if (uc == KB_KEY_DEL) {
+            if (pos < len) {
+                for (int i = pos; i < len - 1; i++)
+                    buf[i] = buf[i + 1];
+                len--;
+                buf[len] = '\0';
+                REDRAW();
+            }
+            continue;
+        }
+
+        /* ── LEFT — move cursor left ─────────────────────────────── */
+        if (uc == KB_KEY_LEFT) {
+            if (pos > 0) {
+                pos--;
                 shell_putchar('\b');
             }
             continue;
         }
 
-        /* ── ARROW UP — history prev ──────────────────────────── */
-        if ((uint8_t)c == KB_KEY_UP) {
+        /* ── RIGHT — move cursor right ───────────────────────────── */
+        if (uc == KB_KEY_RIGHT) {
+            if (pos < len) {
+                shell_putchar((unsigned char)buf[pos]);
+                pos++;
+            }
+            continue;
+        }
+
+        /* ── HOME — jump to start ────────────────────────────────── */
+        if (uc == KB_KEY_HOME) {
+            while (pos > 0) { shell_putchar('\b'); pos--; }
+            continue;
+        }
+
+        /* ── END — jump to end ───────────────────────────────────── */
+        if (uc == KB_KEY_END) {
+            while (pos < len) {
+                shell_putchar((unsigned char)buf[pos]);
+                pos++;
+            }
+            continue;
+        }
+
+        /* ── ARROW UP — history prev ─────────────────────────────── */
+        if (uc == KB_KEY_UP) {
             if (hist_count == 0) continue;
             if (hist_idx == hist_count)
-                strncpy(saved, buf, LINE_MAX - 1);   /* save partial */
+                strncpy(saved, buf, LINE_MAX - 1);
             if (hist_idx > 0) hist_idx--;
-            /* Erase current line visually */
-            for (int i = 0; i < pos; i++) shell_putchar('\b');
-            for (int i = 0; i < pos; i++) shell_putchar(' ');
-            for (int i = 0; i < pos; i++) shell_putchar('\b');
+            /* Erase current display */
+            while (pos > 0) { shell_putchar('\b'); pos--; }
+            for (int i = 0; i < len; i++) shell_putchar(' ');
+            for (int i = 0; i < len; i++) shell_putchar('\b');
             strncpy(buf, history[hist_idx], (size_t)(max - 1));
-            pos = (int)strlen(buf);
+            len = pos = (int)strlen(buf);
             shell_print(buf);
             continue;
         }
 
-        /* ── ARROW DOWN — history next ────────────────────────── */
-        if ((uint8_t)c == KB_KEY_DOWN) {
+        /* ── ARROW DOWN — history next ───────────────────────────── */
+        if (uc == KB_KEY_DOWN) {
             if (hist_idx >= hist_count) continue;
             hist_idx++;
-            for (int i = 0; i < pos; i++) shell_putchar('\b');
-            for (int i = 0; i < pos; i++) shell_putchar(' ');
-            for (int i = 0; i < pos; i++) shell_putchar('\b');
-            if (hist_idx == hist_count) {
+            while (pos > 0) { shell_putchar('\b'); pos--; }
+            for (int i = 0; i < len; i++) shell_putchar(' ');
+            for (int i = 0; i < len; i++) shell_putchar('\b');
+            if (hist_idx == hist_count)
                 strncpy(buf, saved, (size_t)(max - 1));
-            } else {
+            else
                 strncpy(buf, history[hist_idx], (size_t)(max - 1));
-            }
-            pos = (int)strlen(buf);
+            len = pos = (int)strlen(buf);
             shell_print(buf);
             continue;
         }
 
-        /* ── Skip other special keys ──────────────────────────── */
-        if ((uint8_t)c >= 0x80) continue;
+        /* ── Ctrl+A — go to start (like bash) ───────────────────── */
+        if (c == 0x01) {
+            while (pos > 0) { shell_putchar('\b'); pos--; }
+            continue;
+        }
+
+        /* ── Ctrl+E — go to end ──────────────────────────────────── */
+        if (c == 0x05) {
+            while (pos < len) {
+                shell_putchar((unsigned char)buf[pos]);
+                pos++;
+            }
+            continue;
+        }
+
+        /* ── Ctrl+K — kill to end of line ───────────────────────── */
+        if (c == 0x0B) {
+            for (int i = pos; i < len; i++) shell_putchar(' ');
+            for (int i = pos; i < len; i++) shell_putchar('\b');
+            len = pos;
+            buf[len] = '\0';
+            continue;
+        }
+
+        /* ── Drop other special / control keys ───────────────────── */
+        if (uc >= 0x80) continue;
         if ((unsigned)c < 0x20) continue;
 
-        /* ── Normal character ─────────────────────────────────── */
-        if (pos < max - 1) {
-            buf[pos++] = (char)c;
-            buf[pos]   = '\0';
-            shell_putchar((char)c);
+        /* ── Normal character — insert at cursor ─────────────────── */
+        if (len < max - 1) {
+            /* Shift everything from pos onward right by one */
+            for (int i = len; i > pos; i--)
+                buf[i] = buf[i - 1];
+            buf[pos] = (char)c;
+            len++;
+            buf[len] = '\0';
+            /* Print from pos to end, then reposition */
+            for (int i = pos; i < len; i++)
+                shell_putchar((unsigned char)buf[i]);
+            pos++;
+            /* Move cursor back to pos */
+            for (int i = len; i > pos; i--)
+                shell_putchar('\b');
         }
     }
+    #undef REDRAW
 }
 
 /* ---- read password without echo ---- */
@@ -261,8 +398,8 @@ static void cmd_help(void) {
         " Navigation  : cd, pwd, ls [path]\n"
         " Files       : cat, write, create, mkdir, rm, cp, mv, symlink, chattr, df\n"
         " Text        : echo, printf, ack (grep)\n"
-        " System      : mem, tasks, ps, kill, uname, uptime, info, volume, brightness\n"
-        "               clear, halt, reboot\n"
+        " System      : mem, memcheck, tasks, ps, kill, uname, uptime, info, volume\n"
+        "               clear, halt, reboot, shutdown\n"
         " Security    : login, logout, whoami, passwd, users\n"
         " Linux compat: exec <elf> [args]\n"
         " Packages    : draco install/remove/list/approved\n"
@@ -272,6 +409,15 @@ static void cmd_help(void) {
         " Shell utils : export, env, history, type, test, wait, exit,\n"
         "               umask, bg, fg, jobs, read, source, eval, fc\n"
         " Protected   : draco kill <id>  (requires admin + password)\n"
+        "\nKeyboard shortcuts (readline):\n"
+        "  Left / Right   move cursor one character\n"
+        "  Home / End     jump to start / end of line\n"
+        "  Backspace      delete char left of cursor\n"
+        "  Del            delete char at cursor\n"
+        "  Up / Down      history prev / next\n"
+        "  Ctrl+A         go to start of line\n"
+        "  Ctrl+E         go to end of line\n"
+        "  Ctrl+K         kill (delete) from cursor to end\n"
         "\nQuotes: write \"my file\" for filenames with spaces\n"
         "Editor: ^S = save   ^X or Esc = discard   ^K = kill line\n"
     );
@@ -709,6 +855,8 @@ static void cmd_env(void) {
 
 /* ---- cmd_halt ---- */
 static void cmd_halt(void) {
+    serial_print("\n[HALT] System halted by user request.\n");
+    shell_print("\nSystem halted. Safe to power off.\n");
     scr_full_clear(MKATTR(VGA_WHITE, VGA_BLACK));
     scr_print_at(28, 11, "  DracolaxOS — Halted  ",
                  MKATTR(VGA_WHITE, VGA_BLUE));
@@ -954,6 +1102,15 @@ void shell_run(void) {
         else if (!strcmp(cmd,"printf"))    { for(int i=1;i<argc;i++){if(i>1)shell_putchar(' ');shell_print(argv[i]);}shell_putchar('\n'); }
         else if (!strcmp(cmd,"ack")||!strcmp(cmd,"grep")) { if(argc<3)shell_print("usage: ack <pat> <file>\n"); else cmd_ack(argv[1],argv[2]); }
         else if (!strcmp(cmd,"mem"))       { cmd_mem(); }
+        else if (!strcmp(cmd,"memcheck"))  { mem_check(); }
+#ifdef DRACO_DEBUG
+        else if (!strcmp(cmd,"stress"))    {
+            extern void stress_test_main(void);
+            int sid = sched_spawn(stress_test_main, "stress");
+            if (sid >= 0) vga_print("Stress test spawned\n");
+            else vga_print("stress: spawn failed\n");
+        }
+#endif
         else if (!strcmp(cmd,"tasks"))     { cmd_tasks(); }
         else if (!strcmp(cmd,"ps"))        { cmd_ps(); }
         else if (!strcmp(cmd,"kill"))      { cmd_kill(argc,argv); }
@@ -977,7 +1134,6 @@ void shell_run(void) {
         else if (!strcmp(cmd,"reboot"))    { cmd_reboot(); }
         else if (!strcmp(cmd,"shutdown"))  { cmd_shutdown(); }
         else if (!strcmp(cmd,"poweroff"))  { cmd_shutdown(); }
-        else if (!strcmp(cmd,"halt"))      { cmd_shutdown(); }
         else if (!strcmp(cmd,"volume"))    { cmd_volume(argc,argv); }
         else if (!strcmp(cmd,"brightness")){ cmd_brightness(argc,argv); }
         else if (!strcmp(cmd,"login"))     { cmd_login(argc,argv); }

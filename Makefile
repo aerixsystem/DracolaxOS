@@ -1,6 +1,11 @@
-# DracolaxOS Makefile v3.0 — x86_64
+# DracolaxOS Makefile v3.1 — x86_64
 # Targets: build iso run-qemu run-debug run-headless run-vbox clean install-deps tests
 # Project restructured per Phase 0 canonical layout.
+#
+# Build modes:
+#   make              → RELEASE (optimised, no assertions)
+#   make DEBUG=1      → DEBUG   (DRACO_DEBUG defined, assertions on, -O0, extra warnings)
+#   make git msg="Your commit message here" → Git Automation
 # -------------------------------------------------------------------------
 ifneq (, $(shell which x86_64-elf-gcc 2>/dev/null))
     CC    := x86_64-elf-gcc
@@ -13,8 +18,21 @@ else
 endif
 AS   := nasm
 GRUB := grub-mkrescue
+GIT_MSG ?= update: minor changes and fixes
 
-CFLAGS := -ffreestanding -std=c11 -O2 -Wall -Wextra \
+# ── Build mode ────────────────────────────────────────────────────────────
+ifdef DEBUG
+    OPT_FLAGS := -O0 -g -DDRACO_DEBUG
+    $(info [BUILD] DEBUG mode — assertions ON, optimisation OFF)
+else ifdef STABLE
+    OPT_FLAGS := -O2 -DDRACO_STABLE
+    $(info [BUILD] STABLE mode — animations OFF, assets minimal, stability focus)
+else
+    OPT_FLAGS := -O2
+    $(info [BUILD] RELEASE mode — assertions OFF, optimised)
+endif
+
+CFLAGS := -ffreestanding -std=c11 $(OPT_FLAGS) -Wall -Wextra \
           -fno-stack-protector -fno-pie -fno-builtin \
           -mcmodel=large -mno-red-zone -mno-sse -mno-mmx \
           -nostdinc \
@@ -24,6 +42,7 @@ CFLAGS := -ffreestanding -std=c11 -O2 -Wall -Wextra \
           -Ikernel/fs \
           -Ikernel/sched \
           -Ikernel/ipc \
+          -Ikernel/dxi \
           -Ikernel/drivers/ata \
           -Ikernel/drivers/ps2 \
           -Ikernel/drivers/serial \
@@ -39,7 +58,7 @@ CFLAGS := -ffreestanding -std=c11 -O2 -Wall -Wextra \
           -Igui/compositor \
           -Igui/wm \
           -Igui/desktop/default-desktop \
-          -Iapps/appman \
+          -Ikernel/appman \
           -Iapps/debug_console \
           -Iapps/disk_manager \
           -Iapps/filemanager \
@@ -70,7 +89,8 @@ KERNEL_CORE := \
     kernel/limits.c \
     kernel/bootmode.c \
     kernel/atlas.c \
-    kernel/lxs_kernel.c
+    kernel/lxs_kernel.c \
+    kernel/dxi/dxi.c
 
 # kernel/arch/x86_64
 KERNEL_ARCH := \
@@ -164,12 +184,21 @@ SERVICES := \
 GUI := \
     gui/compositor/compositor.c \
     gui/wm/wm.c \
-    gui/desktop/default-desktop/desktop.c
+    gui/desktop/default-desktop/desktop.c \
+    gui/desktop/default-desktop/dock.c \
+    gui/desktop/default-desktop/ws_switcher.c \
+    gui/desktop/default-desktop/ctx_resolver.c \
+    gui/desktop/default-desktop/ctx_menu.c
 
-# apps
+# GUI app manager + built-in app implementations
+# Note: appman lives in kernel/appman (it is kernel infrastructure, not a userland app).
+# Userland apps (ELF binaries) live in userland/apps/ and are loaded via exec/draco.
+APPMAN := \
+    kernel/appman/appman.c \
+    kernel/appman/apps.c
+
+# kernel-linked system components (installer, debug console, etc.)
 APPS := \
-    apps/appman/appman.c \
-    apps/appman/apps.c \
     apps/installer/installer.c \
     apps/debug_console/debug_console.c \
     apps/filemanager/file_manager.c \
@@ -179,6 +208,13 @@ APPS := \
 # drx cli
 DRX := \
     drx/cli/draco-install.c
+
+# stress test (compiled into kernel only in DEBUG mode)
+ifdef DEBUG
+STRESS := tests/stress_kernel.c
+else
+STRESS :=
+endif
 
 C_SOURCES := \
     $(KERNEL_CORE) \
@@ -194,8 +230,10 @@ C_SOURCES := \
     $(LXSCRIPT) \
     $(SERVICES) \
     $(GUI) \
+    $(APPMAN) \
     $(APPS) \
-    $(DRX)
+    $(DRX) \
+    $(STRESS)
 
 ASM_SOURCES := \
     kernel/arch/x86_64/boot.s \
@@ -295,3 +333,12 @@ install-deps:
 	  build-essential nasm grub-pc-bin grub-common \
 	  xorriso mtools qemu-system-x86 \
 	  gcc-x86-64-linux-gnu binutils-x86-64-linux-gnu
+
+git:
+	@echo "📂 Staging all changes..."
+	git add .
+	@echo "💾 Committing with message: $(if $(msg),$(msg),$(GIT_MSG))"
+	@git commit -m "$(if $(msg),$(msg),$(GIT_MSG))"
+	@echo "🚀 Pushing to remote repository..."
+	git push
+	@echo "✅ Project updated successfully!"

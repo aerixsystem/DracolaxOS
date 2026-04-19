@@ -38,6 +38,7 @@ static const cursor_def_t cursor_defs[] = {
     /* CURSOR_BUSY     */ { 32, 32,  8,  8, cursor_busy_data     },
     /* CURSOR_RESIZE_H */ { 32, 32, 16,  7, cursor_resize_h_data },
     /* CURSOR_RESIZE_V */ { 32, 32,  7, 16, cursor_resize_v_data },
+    /* CURSOR_GRAB     */ { 32, 32,  8,  2, cursor_grab_data     },
 };
 #define CURSOR_NDEFS ((int)(sizeof(cursor_defs)/sizeof(cursor_defs[0])))
 

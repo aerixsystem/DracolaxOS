@@ -14,6 +14,7 @@
 #include "../../log.h"
 #include "../../klibc.h"
 #include "../../linux/linux_syscall.h"
+#include "../../uaccess.h"
 
 /* ---- Draco native syscall numbers -------------------------------------- */
 /* Kept separate from Linux numbers to avoid collisions. */
@@ -25,21 +26,46 @@
 /* ---- Draco native dispatch --------------------------------------------- */
 
 static int draco_sys_write(uint32_t fd, const char *buf, uint32_t len) {
+    /* Validate user buffer before touching it */
+    if (!access_ok(buf, len)) {
+        kwarn("SYS_WRITE: bad user buf 0x%llx len=%u\n",
+              (unsigned long long)(uintptr_t)buf, len);
+        return -14; /* -EFAULT */
+    }
     if (fd == 1 || fd == 2) {
-        for (uint32_t i = 0; i < len; i++) vga_putchar(buf[i]);
+        /* Copy to kernel stack to avoid TOCTOU on user buffer */
+        char kbuf[256];
+        uint32_t remaining = len;
+        uint32_t off = 0;
+        while (remaining > 0) {
+            uint32_t chunk = remaining < sizeof(kbuf) ? remaining : (uint32_t)sizeof(kbuf);
+            if (copy_from_user(kbuf, buf + off, chunk) != 0) return -14;
+            for (uint32_t i = 0; i < chunk; i++) vga_putchar(kbuf[i]);
+            off += chunk;
+            remaining -= chunk;
+        }
         return (int)len;
     }
     return -1;
 }
 
 static int draco_sys_read(uint32_t fd, char *buf, uint32_t len) {
+    if (!access_ok(buf, len)) {
+        kwarn("SYS_READ: bad user buf 0x%llx len=%u\n",
+              (unsigned long long)(uintptr_t)buf, len);
+        return -14; /* -EFAULT */
+    }
     if (fd == 0) {
-        for (uint32_t i = 0; i < len; i++) {
-            int c = keyboard_read();   /* FIX A1: int not char — KB_KEY_* >= 0x80 must not sign-extend */
-            buf[i] = c;
-            if (c == '\n') return (int)(i + 1);
+        char kbuf[256];
+        uint32_t collected = 0;
+        while (collected < len) {
+            int c = keyboard_read();
+            kbuf[collected] = (char)c;
+            collected++;
+            if (c == '\n' || collected >= sizeof(kbuf)) break;
         }
-        return (int)len;
+        if (copy_to_user(buf, kbuf, collected) != 0) return -14;
+        return (int)collected;
     }
     return -1;
 }

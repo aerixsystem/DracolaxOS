@@ -33,18 +33,6 @@ int               appman_count(void);
 const app_entry_t *appman_get(int idx);
 
 /* Built-in app entry points */
-void app_text_editor(void);
-void app_file_manager(void);
-void app_system_monitor(void);
 void app_terminal(void);
-void app_calculator(void);
-void app_settings(void);
-void app_pkg_manager(void);
-void app_shield_ui(void);
-void app_draco_manager(void);
-void app_login_manager(void);
-void app_paint(void);
-void app_image_viewer(void);
-void app_media_player(void);
 
 #endif /* APPMAN_H */

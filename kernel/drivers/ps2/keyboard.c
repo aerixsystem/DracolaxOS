@@ -17,7 +17,7 @@
 #include "../../arch/x86_64/irq.h"
 #include "../../arch/x86_64/pic.h"
 #include "../../log.h"
-#include "../../sched/sched.h"
+#include "../../sched/sched.h"   /* sched_current_id(), sched_yield() */
 
 #define KB_DATA   0x60
 #define KB_STATUS 0x64
@@ -55,7 +55,14 @@ static const char sc_shifted[128] = {
 /* ---- IRQ counter (read by irq_watchdog_task in init.c) ----------------- */
 volatile uint32_t g_irq1_count = 0;
 
-/* ---- Ring buffer -------------------------------------------------------- */
+/* ---- Ring buffer — kept for early-boot fallback only -------------------
+ * NOTE: ring_push() no longer writes to ring[]. All input is routed
+ * exclusively through input_router so keyboard_getchar() only reads from
+ * one place per task. Writing to both caused every key to appear twice:
+ *   1. input_router_getchar() consumed it → returned
+ *   2. ring[] still had it → returned again on next call (fallback path)
+ * The ring[] variables are kept but unused to avoid touching the rest of
+ * the struct/header. */
 static uint8_t          ring[KB_BUF];
 static volatile uint8_t r_head, r_tail;
 
@@ -63,16 +70,20 @@ static volatile uint8_t r_head, r_tail;
 static int shifted;
 static int ctrl_dn;
 static int alt_dn;
-static int ext_seq;   /* 1 when last byte was 0xE0 */
+static int caps_lock;  /* 1 = Caps Lock active (toggled on press) */
+static int ext_seq;    /* 1 when last byte was 0xE0 */
 
 /* Per-key pressed state, indexed by KB_KEY_* */
 static uint8_t key_state[256];
 
 static void ring_push(uint8_t c) {
+    /* FIX: write input_router first (primary path), then ring[] for sync.
+     * keyboard_getchar() reads ONLY from input_router now, so ring[] is
+     * kept in sync only for potential legacy/debug reads — NOT consumed
+     * by keyboard_getchar(), which eliminates the double-key delivery. */
+    input_router_push((char)c);
     uint8_t next = (uint8_t)((r_tail + 1u) & (KB_BUF - 1u));
     if (next != r_head) { ring[r_tail] = c; r_tail = next; }
-    /* FIX 1.11/2.1: also route to the per-task focused queue */
-    input_router_push((char)c);
 }
 
 /* Extended scancode -> KB_KEY_* */
@@ -150,7 +161,9 @@ static void kb_handler(struct isr_frame *f) {
     if (sc == 0x9D) { ctrl_dn = 0; key_state[KB_KEY_CTRL] = 0; return; }
     if (sc == 0x38) { alt_dn  = 1; key_state[KB_KEY_ALT]  = 1; return; }
     if (sc == 0xB8) { alt_dn  = 0; key_state[KB_KEY_ALT]  = 0; return; }
-    if (sc == 0x3A) { return; } /* CapsLock – not implemented yet */
+    /* Caps Lock — toggle on press (0x3A), ignore release (0xBA) */
+    if (sc == 0x3A) { caps_lock = !caps_lock; key_state[KB_KEY_CAPS] = (uint8_t)caps_lock; return; }
+    if (sc == 0xBA) { return; } /* Caps Lock release — already handled on press */
 
     if (sc & 0x80) return;   /* key-release codes for non-modifier keys */
     if (sc >= 128)  return;
@@ -165,6 +178,15 @@ static void kb_handler(struct isr_frame *f) {
     char c = map[sc];
     if (!c) return;
 
+    /* Apply Caps Lock to letter keys only.
+     * Caps Lock inverts the shift state for a-z / A-Z:
+     *   no-shift + caps → uppercase
+     *   shift    + caps → lowercase (same as shift cancels caps) */
+    if (caps_lock && !ctrl_dn) {
+        if (c >= 'a' && c <= 'z') c = (char)(c - 32);   /* → uppercase */
+        else if (c >= 'A' && c <= 'Z') c = (char)(c + 32); /* → lowercase */
+    }
+
     /* Ctrl+letter -> control code (^A=1 .. ^Z=26) */
     if (ctrl_dn) {
         if      (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 1);
@@ -178,7 +200,7 @@ static void kb_handler(struct isr_frame *f) {
 
 void keyboard_init(void) {
     r_head = r_tail = 0;
-    shifted = ctrl_dn = alt_dn = ext_seq = 0;
+    shifted = ctrl_dn = alt_dn = ext_seq = caps_lock = 0;
     for (int i = 0; i < 256; i++) key_state[i] = 0;
 
     /* Drain stale bytes in PS/2 output buffer */
@@ -195,28 +217,27 @@ void keyboard_init(void) {
 }
 
 int keyboard_getchar(void) {
-    if (r_head == r_tail) return 0;
-    uint8_t c = ring[r_head];
-    r_head = (uint8_t)((r_head + 1u) & (KB_BUF - 1u));
-    return (int)(uint8_t)c;   /* widen without sign-extension */
+    /* Read ONLY from this task's per-task input_router queue.
+     * The old dual-path (input_router first, then ring[] fallback) caused
+     * every key to be delivered twice: input_router consumed it and returned,
+     * then the next call fell through to ring[] which still had the same char.
+     * Removing the ring[] fallback eliminates all double-key events. */
+    int c = input_router_getchar(sched_current_id());
+    return (c >= 0) ? c : 0;
 }
 
 int keyboard_read(void) {
     int c;
-    /* Use sched_yield() instead of bare "sti; hlt" so the scheduler
-     * can run other tasks while we wait.  "sti; hlt" wakes on every
-     * interrupt (including IRQ12 mouse), and under heavy mouse traffic
-     * the CPU re-enters this loop so fast that the PIC's IRR can lose
-     * the IRQ1 pending edge, causing the keyboard to go silent. */
     while (!(c = keyboard_getchar()))
         sched_yield();
     return c;
 }
 
 int keyboard_key_down(uint8_t keycode) { return (int)key_state[keycode]; }
-int keyboard_shift(void) { return shifted; }
-int keyboard_ctrl(void)  { return ctrl_dn; }
-int keyboard_alt(void)   { return alt_dn;  }
+int keyboard_shift(void)     { return shifted; }
+int keyboard_ctrl(void)      { return ctrl_dn; }
+int keyboard_alt(void)       { return alt_dn;  }
+int keyboard_caps_lock(void) { return caps_lock; }
 
 /* keyboard_reinit — called after mouse_init() to guarantee PS/2 controller
  * has kbd IRQ1 enabled.  mouse_init() reads and rewrites the PS/2 config

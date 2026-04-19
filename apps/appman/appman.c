@@ -71,10 +71,10 @@ const app_entry_t *appman_get(int idx) {
 }
 
 void appman_init(void) {
+    appman_register("Terminal",        "System",      app_terminal);
     appman_register("Text Editor",     "Accessories", app_text_editor);
     appman_register("File Manager",    "System",      app_file_manager);
     appman_register("System Monitor",  "System",      app_system_monitor);
-    appman_register("Terminal",        "System",      app_terminal);
     appman_register("Calculator",      "Accessories", app_calculator);
     appman_register("Settings",        "System",      app_settings);
     appman_register("Package Manager", "System",      app_pkg_manager);

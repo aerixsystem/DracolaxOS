@@ -1,40 +1,24 @@
 /* gui/desktop/default-desktop/desktop.c
- * DracolaxOS V1 — Glassmorphism Desktop
+ * DracolaxOS Glassmorphism Desktop — v2.0
  *
- * FIX v1.2 (verified against ChatGPT audit — all 5 core bugs confirmed real):
+ * Architecture (split for easy updating):
+ *   dock.c         — floating side panel, app icons, clock, user
+ *   ws_switcher.c  — Tab-triggered workspace switcher overlay
+ *   desktop.c      — wallpaper, login, ctx menu, about, search + main loop
  *
- *   [1] CURSOR OWNERSHIP BUG — arrow keys now persistently own the cursor
- *       until the mouse physically moves.  Old code called mouse_get_x()
- *       every frame and then applied the arrow-key delta, so the NEXT frame's
- *       mouse_get_x() would silently overwrite the adjusted position and snap
- *       the cursor back.  New code tracks g_mouse_x_raw / g_mouse_y_raw and
- *       only updates cursor from mouse when the raw value actually changed.
+ * Key changes from v1:
+ *   • No top bar — all chrome lives inside the dock panel.
+ *   • Dock is a floating rounded glass panel, not a full-height strip.
+ *   • Tab (with desktop focus) → workspace switcher centred overlay.
+ *   • Right-click dock icon  → pin/unpin (no restart needed).
+ *   • Scroll wheel over dock → scroll app list.
+ *   • App launch bug fixed   — dock.c uses correct slot→name mapping.
  *
- *   [2] ROUNDED-CORNER OVERWRITE — glass_panel() already drew a rounded inner
- *       fill via fb_rounded_rect(), but every caller immediately followed with
- *       fb_fill_rect() (a square fill) that overwrote those curved corners.
- *       glass_panel() now accepts a fill_col parameter and all callers have
- *       the redundant square fb_fill_rect() removed.
- *
- *   [3] BACKGROUND IMAGE — draw_wallpaper() and draw_login() now render the
- *       1536×1024 bg_pixels[] array from background.h using nearest-neighbour
- *       scaling directly into the shadow-buffer pointer (avoids per-pixel
- *       function-call overhead).  A g_wallpaper_dirty flag skips the expensive
- *       scaled blit on frames where the desktop area has not changed.
- *
- *   [4] DOCK BUTTON ACTIONS — Start, Search, and Terminal buttons now do
- *       something visible:
- *         * Start    → opens/closes a glass app-launcher grid (Start Menu)
- *         * Search   → opens/closes a search-query input bar
- *         * Terminal → toggles the built-in Debug Console (same as F12)
- *         * Info     → About panel (unchanged)
- *       Right-click CTX_TERMINAL also opens the Debug Console (FIX [5]).
- *
- *   [5] LOG SPAM IN GRAPHICAL MODE — fb_console_lock(1) was already called on
- *       desktop entry which stops fb_console_print().  Additionally the
- *       irq_watchdog_task in init.c now skips its kinfo() calls when
- *       bootmode_wants_desktop() is true, eliminating the 5-second tick spam
- *       in text / graphical modes.
+ * Fix inheritance from v1:
+ *   [1] Cursor ownership delta-check.
+ *   [2] sched_yield() throughout startup.
+ *   [3] Nearest-neighbour wallpaper blit.
+ *   [5] SHELL/TEXT fb_console guard.
  */
 
 #include "../../../kernel/types.h"
@@ -50,20 +34,51 @@
 #include "../../../kernel/security/dracoauth.h"
 #include "../../compositor/compositor.h"
 #include "../../wm/wm.h"
-#include "../../../apps/appman/appman.h"
+#include "appman.h"
 #include "../../../apps/installer/installer.h"
 #include "../../../apps/debug_console/debug_console.h"
 #include "../../../services/power_manager.h"
 #include "../../../kernel/draco_logo.h"
-
-/* FIX [3]: background pixel array (1536×1024, 0xAARRGGBB row-major).
- * WARNING: background.h is 100 000+ lines. Only include here. */
-#include "background.h"
+#include "../../../kernel/dxi/dxi.h"
 #include "../../../kernel/drivers/vga/cursor.h"
 #include "../../../kernel/arch/x86_64/rtc.h"
 
+#include "../../../kernel/drivers/ps2/input_router.h"
+#include "dock.h"
+#include "ws_switcher.h"
+#include "desktop.h"
+#include "background.h"
+#include "ctx_resolver.h"   /* Layer 2: context resolver  */
+#include "ctx_menu.h"        /* Layer 3: context menu UI   */
+
+/* forward declaration — defined after UI State section */
+static void blit_bg_scaled(uint32_t dx0, uint32_t dy0,
+                            uint32_t dw,  uint32_t dh,
+                            uint32_t overlay_a);
+/* Hoisted so desktop_blit_bg_at (below) can reference it before the full
+ * UI State block where it would otherwise be declared. */
+static uint32_t g_bg_overlay = 70u;
+/* Debug flag — toggled via Ctrl+B; declared here so desktop_blit_bg_at can see it */
+static int g_bg_disabled = 0;
+
 /* =========================================================================
- * Colour palette — Glassmorphism
+ * desktop_blit_bg_at — expose raw wallpaper blit to dock/overlays.
+ * Called by dock_draw() before blur so each frame starts with fresh pixels.
+ * ========================================================================= */
+void desktop_blit_bg_at(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    if (g_bg_disabled) {
+        fb_fill_rect(x, y, w, h, 0x202020u);
+        return;
+    }
+#ifndef DRACO_STABLE
+    blit_bg_scaled(x, y, w, h, g_bg_overlay);
+#else
+    fb_fill_rect(x, y, w, h, COL_GLASS_BG);
+#endif
+}
+
+/* =========================================================================
+ * Palette
  * ========================================================================= */
 #define COL_VOID        0x04040Cu
 #define COL_GLASS_BG    0x0F1020u
@@ -78,98 +93,62 @@
 #define COL_TEXT_DIM    0x60607Au
 #define COL_OK          0x28C878u
 #define COL_ERR         0xC82828u
-#define COL_WARN        0xC8A020u
-#define COL_TOPBAR      0x10122Au
-#define COL_DOCK        0x10122Au
 #define COL_SEP         0x2A2C50u
 
-/* Dark overlay applied over bg image so text/panels stay readable */
 #define BG_OVERLAY_R  4u
 #define BG_OVERLAY_G  4u
 #define BG_OVERLAY_B  16u
-#define BG_OVERLAY_A   70u   /* 0-255 — reduced from 140; was too dark */
 
-/* =========================================================================
- * Layout constants
- * ========================================================================= */
-#define TOPBAR_H   28
-#define DOCK_W     72
-#define DOCK_PAD    8
-#define BTN_SZ     52
-#define BTN_GAP     8
-#define CORNER_R    8
-
-#define FONT_W      8
-#define FONT_H     16
-#define FONT2_W    16
-#define FONT2_H    32
+#define FONT_W  8
+#define FONT_H  16
+#define CORNER_R 8
 
 /* =========================================================================
  * UI State
  * ========================================================================= */
-#define NUM_WORKSPACES 4
+#define NUM_WORKSPACES WS_COUNT
+
 static int  g_ws        = 0;
 static int  g_logged_in = 0;
 static int  g_ticks     = 0;
 
-/* ---- cursor ------------------------------------------------------------ */
 static int g_cx = 0, g_cy = 0;
+static int g_mouse_x_raw = -1, g_mouse_y_raw = -1;
 
-/* FIX [1]: raw mouse position tracking */
-static int g_mouse_x_raw = -1;
-static int g_mouse_y_raw = -1;
-
-/* ---- wallpaper dirty flag (FIX [3]) ------------------------------------ */
 static int      g_wallpaper_dirty = 1;
-static uint32_t g_bg_overlay      = BG_OVERLAY_A;  /* adjustable overlay alpha */
+/* g_bg_overlay declared early (before desktop_blit_bg_at) — not re-declared here */
 
-/* ---- right-click menu -------------------------------------------------- */
-static int g_ctx_open = 0, g_ctx_x = 0, g_ctx_y = 0;
+/* g_bg_overlay and g_bg_disabled declared early (before desktop_blit_bg_at) */
 
-typedef struct { const char *label; int id; } ctx_item_t;
-#define CTX_CHANGE_BG  1
-#define CTX_TERMINAL   2
-#define CTX_ABOUT      3
-#define CTX_LOGOUT     4
-#define CTX_REBOOT     5
-#define CTX_SHUTDOWN   6
+/* Window drag state */
+static int g_drag_win   = -1;   /* handle of window being dragged, or -1 */
+static int g_drag_off_x =  0;   /* cursor offset from window x when drag started */
+static int g_drag_off_y =  0;   /* cursor offset from window y when drag started */
 
-static const ctx_item_t CTX_ITEMS[] = {
-    { "  Change Background  ", CTX_CHANGE_BG },
-    { "  Open Terminal      ", CTX_TERMINAL  },
-    { "  About DracolaxOS   ", CTX_ABOUT     },
-    { "  Log Out            ", CTX_LOGOUT    },
-    { "  Restart            ", CTX_REBOOT    },
-    { "  Shut Down          ", CTX_SHUTDOWN  },
-};
-#define CTX_COUNT 6
-#define CTX_W   200
-#define CTX_IH   26
+/* Window resize state ─────────────────────────────────────────────────────
+ * g_resize_win  : compositor handle of window being resized (-1 = none)
+ * g_resize_edge : which edge/corner is being dragged
+ * g_resize_ox/oy: window origin (x,y) at the moment resize started
+ * g_resize_ow/oh: window size   (w,h) at the moment resize started
+ * g_resize_mx/my: cursor position at the moment resize started         */
+static int           g_resize_win  = -1;
+static resize_edge_t g_resize_edge = RESIZE_NONE;
+static int           g_resize_ox   = 0, g_resize_oy = 0;
+static int           g_resize_ow   = 0, g_resize_oh = 0;
+static int           g_resize_mx   = 0, g_resize_my = 0;
 
-/* ---- dock buttons ------------------------------------------------------ */
-typedef struct { const char *icon; const char *label; uint32_t accent; } dock_btn_t;
-static const dock_btn_t DOCK_BTNS[] = {
-    { "[>]", "Start",  0x7828C8u },
-    { "[/]", "Search", 0x2878C8u },
-    { ">_ ", "Term",   0x28C878u },
-    { "[i]", "Info",   0xC8A020u },
-};
-#define DOCK_BTN_COUNT 4
+static int g_about_open = 0;
 
-/* ---- overlay state (FIX [4]) ------------------------------------------ */
-static int g_about_open  = 0;
-static int g_start_open  = 0;
-static int g_search_open = 0;
-
+/* Search */
+static int  g_search_open = 0;
 #define SEARCH_BUF 64
 static char g_search_query[SEARCH_BUF] = "";
+#define SEARCH_MAX_RESULTS 8
+static char  g_sr_names[SEARCH_MAX_RESULTS][APP_NAME_LEN];
+static int   g_sr_count = 0;
+static int   g_sr_sel   = 0;
 
-/* ---- boot logo phase --------------------------------------------------- */
-static int g_boot_phase = 0, g_boot_ticks = 0;
-#define BOOT_LOGO_FRAMES 60
-#define BOOT_FADE_FRAMES 20
-
-/* ---- login input ------------------------------------------------------- */
+/* Login */
 #define LOGIN_BUF 64
 static char g_login_user[LOGIN_BUF] = "root";
 static char g_login_pass[LOGIN_BUF] = "";
@@ -178,22 +157,44 @@ static char g_login_msg[128] = "";
 static int  g_login_msg_err  = 0;
 
 /* =========================================================================
- * FIX [3]: Fast scaled bg blit via shadow-buffer pointer
- * Nearest-neighbour scales bg_pixels[BG_W×BG_H] into any dest rect.
- * An additive dark overlay makes panels readable over the image.
+ * Drawing helpers
+ * ========================================================================= */
+static void hline(uint32_t x, uint32_t y, uint32_t w, uint32_t c) {
+    fb_fill_rect(x, y, w, 1, c);
+}
+
+static void glass_panel(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                         uint32_t border_col, uint32_t fill_col) {
+    uint32_t ir = CORNER_R > 2 ? CORNER_R - 2 : 1;
+    fb_rounded_rect(x+1, y+1, w-2, h-2, ir, fill_col);
+    hline(x+CORNER_R, y,     w-2*CORNER_R, border_col);
+    hline(x+CORNER_R, y+h-1, w-2*CORNER_R, border_col);
+    fb_fill_rect(x,     y+CORNER_R, 1, h-2*CORNER_R, border_col);
+    fb_fill_rect(x+w-1, y+CORNER_R, 1, h-2*CORNER_R, border_col);
+    for (uint32_t i = 1; i <= CORNER_R; i++) {
+        fb_put_pixel(x+CORNER_R-i,     y+CORNER_R-i,     border_col);
+        fb_put_pixel(x+w-CORNER_R+i-1, y+CORNER_R-i,     border_col);
+        fb_put_pixel(x+CORNER_R-i,     y+h-CORNER_R+i-1, border_col);
+        fb_put_pixel(x+w-CORNER_R+i-1, y+h-CORNER_R+i-1, border_col);
+    }
+    hline(x+CORNER_R, y,     w-2*CORNER_R, COL_GLASS_SHINE);
+    hline(x+CORNER_R, y+h-1, w-2*CORNER_R, COL_ACCENT_DIM);
+}
+
+/* =========================================================================
+ * Wallpaper
  * ========================================================================= */
 static void blit_bg_scaled(uint32_t dx0, uint32_t dy0,
-                            uint32_t dw,  uint32_t dh, uint32_t overlay_a) {
+                             uint32_t dw,  uint32_t dh,
+                             uint32_t overlay_a) {
     uint32_t  W      = fb.width;
     uint32_t *shadow = fb_shadow_ptr();
     if (!shadow || dw == 0 || dh == 0) return;
-
     for (uint32_t dy = 0; dy < dh; dy++) {
-        uint32_t        sy      = dy * BG_H / dh;
+        uint32_t sy = dy * BG_H / dh;
         if (sy >= BG_H) sy = BG_H - 1;
         const uint32_t *src_row = bg_pixels + sy * BG_W;
         uint32_t       *dst_row = shadow + (dy0 + dy) * W + dx0;
-
         for (uint32_t dx = 0; dx < dw; dx++) {
             uint32_t sx = dx * BG_W / dw;
             if (sx >= BG_W) sx = BG_W - 1;
@@ -201,7 +202,6 @@ static void blit_bg_scaled(uint32_t dx0, uint32_t dy0,
             uint8_t r = (uint8_t)((raw >> 16) & 0xFF);
             uint8_t g = (uint8_t)((raw >>  8) & 0xFF);
             uint8_t b = (uint8_t)( raw        & 0xFF);
-            /* Blend toward dark overlay colour */
             uint8_t a = (overlay_a > 255u) ? 255u : (uint8_t)overlay_a;
             r = (uint8_t)((r*(255-a) + BG_OVERLAY_R*a) / 255);
             g = (uint8_t)((g*(255-a) + BG_OVERLAY_G*a) / 255);
@@ -211,292 +211,105 @@ static void blit_bg_scaled(uint32_t dx0, uint32_t dy0,
     }
 }
 
-/* =========================================================================
- * Drawing helpers
- * ========================================================================= */
-static void hline(uint32_t x, uint32_t y, uint32_t w, uint32_t c) {
-    fb_fill_rect(x, y, w, 1, c);
-}
-
-/* FIX [2]: fill_col parameter eliminates the square fb_fill_rect() that was
- * overwriting the rounded corners drawn by fb_rounded_rect() inside. */
-static void glass_panel(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
-                         uint32_t border_col, uint32_t fill_col) {
-    uint32_t ir = CORNER_R > 2 ? CORNER_R - 2 : 1;
-    fb_rounded_rect(x+1, y+1, w-2, h-2, ir, fill_col); /* rounded inner fill */
-
-    /* Border as thin lines — does not clip rounded inner corners */
-    hline(x+CORNER_R,   y,       w-2*CORNER_R, border_col);
-    hline(x+CORNER_R,   y+h-1,   w-2*CORNER_R, border_col);
-    fb_fill_rect(x,       y+CORNER_R, 1, h-2*CORNER_R, border_col);
-    fb_fill_rect(x+w-1,   y+CORNER_R, 1, h-2*CORNER_R, border_col);
-    for (uint32_t i = 1; i <= CORNER_R; i++) {
-        fb_put_pixel(x+CORNER_R-i,       y+CORNER_R-i,       border_col);
-        fb_put_pixel(x+w-CORNER_R+i-1,   y+CORNER_R-i,       border_col);
-        fb_put_pixel(x+CORNER_R-i,       y+h-CORNER_R+i-1,   border_col);
-        fb_put_pixel(x+w-CORNER_R+i-1,   y+h-CORNER_R+i-1,   border_col);
-    }
-    hline(x+CORNER_R, y,     w-2*CORNER_R, COL_GLASS_SHINE); /* top shine */
-    hline(x+CORNER_R, y+h-1, w-2*CORNER_R, COL_ACCENT_DIM);  /* bottom shadow */
-}
-
-static void text_center(uint32_t rx, uint32_t ry, uint32_t rw,
-                          const char *s, uint32_t fg, uint32_t bg_col) {
-    uint32_t tw = (uint32_t)strlen(s) * FONT_W;
-    uint32_t tx = (tw < rw) ? rx + (rw-tw)/2 : rx;
-    fb_print(tx, ry, s, fg, bg_col);
-}
-
-/* =========================================================================
- * Wallpaper  (FIX [3])
- * ========================================================================= */
 static void draw_wallpaper(void) {
     if (!g_wallpaper_dirty) return;
     uint32_t W = fb.width, H = fb.height;
-    blit_bg_scaled(DOCK_W, TOPBAR_H, W-DOCK_W, H-TOPBAR_H, g_bg_overlay);
+    if (g_bg_disabled) {
+        /* DEBUG Ctrl+B: solid dark grey — windows visible even if same colour as bg */
+        fb_fill_rect(0, 0, W, H, 0x202020u);
+    } else {
+#ifndef DRACO_STABLE
+        blit_bg_scaled(0, 0, W, H, g_bg_overlay);
+#else
+        fb_fill_rect(0, 0, W, H, COL_GLASS_BG);
+#endif
+    }
     g_wallpaper_dirty = 0;
 }
 
 /* =========================================================================
- * Top bar
+ * Desktop action callbacks (called by ctx_menu.c action dispatcher)
  * ========================================================================= */
-static void draw_topbar(void) {
-    uint32_t W = fb.width;
-    fb_fill_rect(0, 0, W, TOPBAR_H, COL_TOPBAR);
-    hline(0, TOPBAR_H-1, W, COL_SEP);
-    hline(0, 0, W, COL_GLASS_SHINE);
-    fb_print(DOCK_W+10, 6, "DracolaxOS V1", COL_TEXT_HI, COL_TOPBAR);
 
-    uint32_t dot_x = W/2 - (uint32_t)NUM_WORKSPACES*14/2;
-    for (int i=0;i<NUM_WORKSPACES;i++) {
-        uint32_t dc = (i==g_ws)?COL_ACCENT_LT:COL_TEXT_DIM;
-        fb_rounded_rect(dot_x+(uint32_t)i*14, 10, 8, 8, 3, dc);
-        if (i==g_ws) fb_fill_rect(dot_x+(uint32_t)i*14+1, 11, 6, 6, dc);
-    }
+void desktop_refresh(void) {
+    g_wallpaper_dirty = 1;
+    kinfo("DESKTOP: refresh requested\n");
+}
 
-    const char *who = g_logged_in ? dracoauth_whoami() : "guest";
-    /* FIX 3.13: real wall clock — RTC read each topbar refresh */
-    rtc_time_t _dt;
-    rtc_read(&_dt);
-    char _clock[24];
-    snprintf(_clock, sizeof(_clock), "%02u:%02u:%02u  |  %s",
-             _dt.hour, _dt.min, _dt.sec, who);
-    uint32_t rw = (uint32_t)strlen(_clock)*FONT_W;
-    fb_print(W > rw+12 ? W-rw-12 : 0u, 6, _clock, COL_TEXT_MED, COL_TOPBAR);
+void desktop_change_bg(void) {
+    g_bg_overlay = (g_bg_overlay > 180u) ? 90u
+                 : (g_bg_overlay >  40u) ? 10u : 200u;
+    g_wallpaper_dirty = 1;
+}
+
+void desktop_about_open(void) {
+    g_about_open = 1;
+}
+
+void desktop_logout(void) {
+    g_logged_in = 0;
+    g_login_pass[0] = '\0';
+    g_wallpaper_dirty = 1;
+    g_about_open = 0;
+}
+
+/* Begin dragging a window — called from ctx_menu dispatch while inside
+ * the main loop so g_cx/g_cy already hold the current cursor position. */
+void desktop_begin_drag(int win_handle) {
+    if (win_handle < 0) return;
+    int ox, oy;
+    comp_get_pos(win_handle, &ox, &oy);
+    g_drag_win   = win_handle;
+    g_drag_off_x = g_cx - ox;
+    g_drag_off_y = g_cy - oy;
+    /* Abort any concurrent resize */
+    g_resize_win  = -1;
+    g_resize_edge = RESIZE_NONE;
 }
 
 /* =========================================================================
- * Left dock  (FIX [2]: no fb_fill_rect overwrite; FIX [4]: active states)
- * ========================================================================= */
-static void draw_dock(void) {
-    uint32_t H = fb.height;
-    fb_fill_rect(0, TOPBAR_H, DOCK_W, H-TOPBAR_H, COL_DOCK);
-    hline(0, TOPBAR_H, DOCK_W, COL_SEP);   /* BUG FIX: was H-TOPBAR_H (height), must be DOCK_W (width) */
-    for (int i=0;i<3;i++)
-        fb_fill_rect(DOCK_W-1-i, TOPBAR_H, 1, H-TOPBAR_H,
-                     fb_blend(COL_GLASS_EDGE, COL_DOCK, (uint8_t)(80-i*25)));
-
-    int cx=g_cx, cy=g_cy;
-    uint32_t btn_x = (DOCK_W-BTN_SZ)/2;
-    for (int i=0;i<DOCK_BTN_COUNT;i++) {
-        uint32_t btn_y = TOPBAR_H+DOCK_PAD+(uint32_t)i*(BTN_SZ+BTN_GAP);
-        int hover  = (cx>=(int)btn_x && cx<(int)(btn_x+BTN_SZ) &&
-                      cy>=(int)btn_y  && cy<(int)(btn_y+BTN_SZ));
-        int active = (i==0 && g_start_open) || (i==1 && g_search_open);
-        uint32_t ac       = DOCK_BTNS[i].accent;
-        uint32_t fill_col = (hover||active) ? fb_blend(ac,COL_DOCK,80) : COL_GLASS_PANEL;
-        uint32_t bord_col = (active||hover) ? COL_ACCENT_LT : COL_GLASS_EDGE;
-
-        /* FIX [2]: fill passed directly — rounded corners no longer overwritten */
-        glass_panel(btn_x, btn_y, BTN_SZ, BTN_SZ, bord_col, fill_col);
-
-        uint32_t icon_w = (uint32_t)strlen(DOCK_BTNS[i].icon)*FONT2_W;
-        uint32_t icon_x = btn_x + (BTN_SZ>icon_w?(BTN_SZ-icon_w)/2:0);
-        fb_print_s(icon_x, btn_y+6, DOCK_BTNS[i].icon,
-                   (hover||active)?COL_TEXT_HI:ac, fill_col, 2);
-        uint32_t lbl_w = (uint32_t)strlen(DOCK_BTNS[i].label)*FONT_W;
-        uint32_t lbl_x = btn_x + (BTN_SZ>lbl_w?(BTN_SZ-lbl_w)/2:0);
-        fb_print(lbl_x, btn_y+BTN_SZ-FONT_H-4, DOCK_BTNS[i].label,
-                 (hover||active)?COL_TEXT_HI:COL_TEXT_MED, fill_col);
-    }
-
-    /* Workspace switcher — 20px buttons, 4px gap for easier clicking */
-#define WS_BTN_H  20
-#define WS_BTN_GAP 4
-    uint32_t ws_total = (uint32_t)NUM_WORKSPACES*(WS_BTN_H+WS_BTN_GAP);
-    uint32_t ws_start = H > ws_total+16u ? H - ws_total - 8u : H/2;
-    for (int i=0;i<NUM_WORKSPACES;i++) {
-        uint32_t wy = ws_start+(uint32_t)i*(WS_BTN_H+WS_BTN_GAP);
-        uint32_t wc = (i==g_ws)?COL_ACCENT:COL_GLASS_PANEL;
-        fb_fill_rect(8, wy, DOCK_W-16, WS_BTN_H, wc);
-        fb_rounded_rect(8, wy, DOCK_W-16, WS_BTN_H, 3, (i==g_ws)?COL_ACCENT_LT:COL_GLASS_EDGE);
-        char nb[4]; snprintf(nb, sizeof(nb), "%d", i+1);
-        text_center(8, wy+(WS_BTN_H-FONT_H)/2, DOCK_W-16, nb,
-                    (i==g_ws)?COL_TEXT_HI:COL_TEXT_MED, wc);
-    }
-}
-
-/* =========================================================================
- * Context menu  (FIX [2]: fill_col param; FIX [5]: terminal wired)
- * ========================================================================= */
-static void draw_ctx_menu(void) {
-    if (!g_ctx_open) return;
-    uint32_t mh = (uint32_t)CTX_COUNT*CTX_IH+10;
-    uint32_t mx = (uint32_t)g_ctx_x, my = (uint32_t)g_ctx_y;
-    if (mx+CTX_W > fb.width)  mx = fb.width  - CTX_W;
-    if (my+mh    > fb.height) my = fb.height - mh;
-    glass_panel(mx, my, CTX_W, mh, COL_GLASS_EDGE, COL_GLASS_PANEL);
-    fb_fill_rect(mx+2, my+mh, CTX_W, 3, fb_blend(0x000000,COL_VOID,80));
-    for (int i=0;i<CTX_COUNT;i++) {
-        uint32_t iy = my+5+(uint32_t)i*CTX_IH;
-        int hover = (g_cx>=(int)mx && g_cx<(int)(mx+CTX_W) &&
-                     g_cy>=(int)iy  && g_cy<(int)(iy+CTX_IH));
-        if (hover) fb_fill_rect(mx+2, iy, CTX_W-4, CTX_IH, COL_ACCENT_DIM);
-        fb_print(mx+6, iy+5, CTX_ITEMS[i].label,
-                 hover?COL_TEXT_HI:COL_TEXT_MED, 0);
-        if (i<CTX_COUNT-1) hline(mx+4, iy+CTX_IH-1, CTX_W-8, COL_SEP);
-    }
-}
-
-/* =========================================================================
- * About overlay  (FIX [2]: no fb_fill_rect overwrite)
+ * About overlay
  * ========================================================================= */
 static void draw_about(void) {
     if (!g_about_open) return;
-    uint32_t W=fb.width, H=fb.height;
+    uint32_t W = fb.width, H = fb.height;
     uint32_t pw = (W > 560u) ? 480u : W - 40u;
     uint32_t ph = (H > 340u) ? 280u : H - 60u;
-    uint32_t px=(W-pw)/2, py=(H-ph)/2;
-    fb_fill_rect(0, 0, W, H, fb_blend(0x000000,0,160));
+    uint32_t px = (W-pw)/2, py = (H-ph)/2;
+    fb_fill_rect(0, 0, W, H, fb_blend(0x000000u, 0u, 160));
     glass_panel(px, py, pw, ph, COL_ACCENT, COL_GLASS_PANEL);
     fb_print_s(px+20, py+16, "DracolaxOS V1", COL_ACCENT_LT, COL_GLASS_PANEL, 2);
     hline(px+16, py+54, pw-32, COL_SEP);
-    const char *lines[] = {
+    static const char *lines[] = {
         "  Kernel : Draco-1.0 x86_64 (64-bit preemptive)",
         "  ABI    : Draco native + Linux x86_64 (SYSCALL)",
-        "  GUI    : Glassmorphism compositor",
+        "  GUI    : Glassmorphism compositor v2",
+        "  Dock   : Floating panel, Windows 11 style",
         "  Memory : PMM bitmap + bump-allocator heap",
         "  FS     : RAMFS + VFS mount tree",
         "  Author : Lunax (Yunis) + Amilcar",
-        "  Fonts  : Exo 2, Orbitron, Future Z",
         "",
-        "  Press  ESC  or click outside to close",
+        "  Press ESC or click [X] to close",
     };
-    for (int i=0;i<9;i++)
+    for (int i = 0; i < 9; i++)
         fb_print(px+16, py+62+(uint32_t)i*20, lines[i],
-                 i==8?COL_TEXT_DIM:COL_TEXT_MED, 0);
+                 i == 8 ? COL_TEXT_DIM : COL_TEXT_MED, 0);
     fb_fill_rect(px+pw-26, py+8, 18, 18, COL_ERR);
     fb_rounded_rect(px+pw-26, py+8, 18, 18, 3, 0xFF8080u);
     fb_print(px+pw-23, py+11, "X", COL_TEXT_HI, COL_ERR);
 }
 
 /* =========================================================================
- * Start Menu — driven by appman (no hardcoded list; always in sync)
+ * Search overlay (Ctrl+F)
  * ========================================================================= */
-/* Responsive cell sizing: larger on bigger screens */
-#define START_COLS   3
-/* Cell dimensions computed per-draw from fb size — see draw_start_menu() */
-
-/* Appman name cache — filled once per open event, reused while menu is open */
-#define AM_MAX_APPS  APP_MAX
-#define AM_NAME_LEN  APP_NAME_LEN
-static char  g_am_names[AM_MAX_APPS][AM_NAME_LEN];
-static int   g_am_count = 0;
-
-/* Refresh app list from appman — called when the menu opens */
-static void am_refresh(void) {
-    char buf[512];
-    appman_list(buf, sizeof(buf));
-    g_am_count = 0;
-    char *p = buf;
-    while (*p && g_am_count < AM_MAX_APPS) {
-        while (*p == ' ') p++;
-        if (!*p) break;
-        char *ns = p;
-        while (*p && *p != '[' && *p != '\n') p++;
-        char *ne = p;
-        while (ne > ns && *(ne-1) == ' ') ne--;
-        int nl = (int)(ne - ns);
-        if (nl > 0 && nl < AM_NAME_LEN) {
-            memcpy(g_am_names[g_am_count], ns, (size_t)nl);
-            g_am_names[g_am_count][nl] = '\0';
-            g_am_count++;
-        }
-        while (*p && *p != '\n') p++;
-        if (*p == '\n') p++;
-    }
-}
-
-static void draw_start_menu(void) {
-    if (!g_start_open) return;
-    if (g_am_count == 0) am_refresh();
-    if (g_am_count == 0) { g_start_open = 0; return; }
-
-    /* Responsive cell size */
-    uint32_t cell_w = (fb.width  > 900u) ? 116u : 96u;
-    uint32_t cell_h = (fb.height > 600u) ?  86u : 70u;
-    uint32_t cols   = START_COLS;
-    uint32_t rows   = ((uint32_t)g_am_count + cols - 1u) / cols;
-    uint32_t pw     = cols * cell_w + 24u;
-    uint32_t ph     = rows * cell_h + 52u;
-    /* Clamp to visible area */
-    uint32_t avail_w = fb.width  - (uint32_t)DOCK_W - 20u;
-    uint32_t avail_h = fb.height - (uint32_t)TOPBAR_H - 12u;
-    if (pw > avail_w) pw = avail_w;
-    if (ph > avail_h) ph = avail_h;
-    uint32_t px = (uint32_t)DOCK_W + 8u;
-    uint32_t py = (fb.height > ph + (uint32_t)TOPBAR_H + 8u)
-                  ? fb.height - ph - 8u : (uint32_t)TOPBAR_H + 4u;
-
-    glass_panel(px, py, pw, ph, COL_ACCENT, COL_GLASS_BG);
-    fb_print_s(px + 10u, py + 8u, "Apps", COL_ACCENT_LT, COL_GLASS_BG, 1);
-    hline(px + 8u, py + 28u, pw - 16u, COL_SEP);
-
-    for (int i = 0; i < g_am_count; i++) {
-        uint32_t col2 = (uint32_t)(i % (int)cols);
-        uint32_t row2 = (uint32_t)(i / (int)cols);
-        uint32_t cx2  = px + 12u + col2 * cell_w;
-        uint32_t cy2  = py + 38u + row2 * cell_h;
-        uint32_t bw   = cell_w - 8u;
-        uint32_t bh   = cell_h - 8u;
-        if (cx2 + bw > px + pw - 4u || cy2 + bh > py + ph - 4u) continue;
-        int hover = (g_cx >= (int)cx2 && g_cx < (int)(cx2 + bw) &&
-                     g_cy >= (int)cy2 && g_cy < (int)(cy2 + bh));
-        uint32_t cf = hover ? COL_ACCENT_DIM : COL_GLASS_PANEL;
-        glass_panel(cx2, cy2, bw, bh,
-                    hover ? COL_ACCENT_LT : COL_GLASS_EDGE, cf);
-        /* Two-character icon from app name initials */
-        char icon[3] = {
-            g_am_names[i][0],
-            (g_am_names[i][1] ? g_am_names[i][1] : ' '),
-            '\0'
-        };
-        fb_print_s(cx2 + 4u, cy2 + 5u, icon,
-                   hover ? COL_TEXT_HI : COL_ACCENT_LT, cf, 2);
-        uint32_t lw2 = (uint32_t)strlen(g_am_names[i]) * FONT_W;
-        uint32_t lx2 = cx2 + (bw > lw2 ? (bw - lw2) / 2u : 2u);
-        fb_print(lx2, cy2 + bh - FONT_H - 3u, g_am_names[i],
-                 hover ? COL_TEXT_HI : COL_TEXT_MED, cf);
-    }
-}
-
-/* =========================================================================
- * Search overlay — live app filtering
- * Results: apps whose names contain the query string (case-insensitive).
- * Enter on a single match launches it; Enter with no query closes.
- * ========================================================================= */
-
-/* Case-insensitive strstr using only kernel klibc (no toupper dependency) */
-static int search_match(const char *haystack, const char *needle) {
-    if (!needle[0]) return 0;  /* empty query matches nothing */
+static int search_match(const char *hay, const char *needle) {
+    if (!needle[0]) return 0;
     size_t nl = strlen(needle);
-    for (size_t i = 0; haystack[i]; i++) {
+    for (size_t i = 0; hay[i]; i++) {
         int ok = 1;
         for (size_t j = 0; j < nl && ok; j++) {
-            char h = haystack[i+j];
-            char n = needle[j];
+            char h = hay[i+j], n = needle[j];
             if (!h) { ok = 0; break; }
-            /* cheap lowercase: A-Z → a-z */
             if (h >= 'A' && h <= 'Z') h += 32;
             if (n >= 'A' && n <= 'Z') n += 32;
             if (h != n) ok = 0;
@@ -506,139 +319,125 @@ static int search_match(const char *haystack, const char *needle) {
     return 0;
 }
 
-/* Search result scratch buffer */
-#define SEARCH_MAX_RESULTS 8
-static char  g_sr_names[SEARCH_MAX_RESULTS][AM_NAME_LEN];
-static int   g_sr_count = 0;
-static int   g_sr_sel   = 0;   /* keyboard-highlighted result */
-
-static void search_update_results(void) {
-    g_sr_count = 0;
-    g_sr_sel   = 0;
+static void search_update(void) {
+    g_sr_count = 0; g_sr_sel = 0;
     if (!g_search_query[0]) return;
     int total = appman_count();
     for (int i = 0; i < total && g_sr_count < SEARCH_MAX_RESULTS; i++) {
         const app_entry_t *a = appman_get(i);
         if (a && search_match(a->name, g_search_query)) {
-            strncpy(g_sr_names[g_sr_count], a->name, AM_NAME_LEN - 1);
-            g_sr_names[g_sr_count][AM_NAME_LEN - 1] = '\0';
+            strncpy(g_sr_names[g_sr_count], a->name, APP_NAME_LEN - 1);
+            g_sr_names[g_sr_count][APP_NAME_LEN - 1] = '\0';
             g_sr_count++;
         }
     }
 }
 
-static void draw_search_overlay(void) {
+static void draw_search(void) {
     if (!g_search_open) return;
-    uint32_t W = fb.width;
-    uint32_t pw = (W - (uint32_t)DOCK_W > 440u) ? 400u : W - (uint32_t)DOCK_W - 40u;
-    uint32_t result_h = (g_sr_count > 0) ? (uint32_t)g_sr_count * 24u + 8u : 0u;
+    uint32_t dock_right = (uint32_t)(DOCK_PANEL_X + DOCK_W + 12);
+    uint32_t avail = fb.width - dock_right;
+    uint32_t pw = (avail > 440u) ? 400u : avail - 40u;
+    uint32_t result_h = g_sr_count > 0 ? (uint32_t)g_sr_count * 24u + 8u : 0u;
     uint32_t ph = 64u + result_h;
-    uint32_t px = (uint32_t)DOCK_W + (W - (uint32_t)DOCK_W - pw) / 2u;
-    uint32_t py = (uint32_t)TOPBAR_H + 12u;
+    uint32_t px = dock_right + (avail - pw) / 2;
+    uint32_t py = 20u;
 
     glass_panel(px, py, pw, ph, COL_ACCENT, COL_GLASS_PANEL);
-
-    /* Search icon */
-    fb_print(px + 10u, py + 20u, "[/]", COL_ACCENT_LT, COL_GLASS_PANEL);
-
-    /* Input field */
-    uint32_t fx = px + 40u, fw = pw - 56u;
-    fb_fill_rect(fx, py + 14u, fw, 28u, 0x0C0E22u);
-    fb_rounded_rect(fx, py + 14u, fw, 28u, 4u, COL_ACCENT_LT);
-    fb_print(fx + 6u, py + 20u,
+    fb_print(px+10, py+20, "[/]", COL_ACCENT_LT, COL_GLASS_PANEL);
+    uint32_t fx = px + 40, fw = pw - 56;
+    fb_fill_rect(fx, py+14, fw, 28, 0x0C0E22u);
+    fb_rounded_rect(fx, py+14, fw, 28, 4, COL_ACCENT_LT);
+    fb_print(fx+6, py+20,
              g_search_query[0] ? g_search_query : "Type app name...",
-             g_search_query[0] ? COL_TEXT_HI : COL_TEXT_DIM, 0u);
+             g_search_query[0] ? COL_TEXT_HI : COL_TEXT_DIM, 0);
     if (g_ticks % 60 < 40) {
-        uint32_t cx3 = fx + 6u + (uint32_t)strlen(g_search_query) * FONT_W;
-        fb_fill_rect(cx3, py + 20u, 2u, FONT_H, COL_ACCENT_LT);
+        uint32_t cx3 = fx+6 + (uint32_t)strlen(g_search_query)*FONT_W;
+        fb_fill_rect(cx3, py+20, 2, FONT_H, COL_ACCENT_LT);
     }
-    fb_print(px + pw - 90u, py + 20u, "ESC to close", COL_TEXT_DIM, COL_GLASS_PANEL);
+    fb_print(px+pw-80, py+20, "ESC to close", COL_TEXT_DIM, COL_GLASS_PANEL);
 
-    /* Results list */
     if (g_sr_count > 0) {
-        hline(px + 8u, py + 56u, pw - 16u, COL_SEP);
+        hline(px+8, py+56, pw-16, COL_SEP);
         for (int i = 0; i < g_sr_count; i++) {
-            uint32_t ry = py + 64u + (uint32_t)i * 24u;
-            int hover = (g_cy >= (int)ry && g_cy < (int)(ry + 24u) &&
-                         g_cx >= (int)px && g_cx < (int)(px + pw));
-            int sel   = (i == g_sr_sel);
-            if (hover || sel)
-                fb_fill_rect(px + 2u, ry, pw - 4u, 24u, COL_ACCENT_DIM);
-            fb_print(px + 14u, ry + 4u, g_sr_names[i],
-                     (hover || sel) ? COL_TEXT_HI : COL_TEXT_MED,
-                     (hover || sel) ? COL_ACCENT_DIM : COL_GLASS_PANEL);
+            uint32_t ry = py+64 + (uint32_t)i*24;
+            int hov = (g_cy>=(int)ry&&g_cy<(int)(ry+24)&&
+                       g_cx>=(int)px&&g_cx<(int)(px+pw));
+            int sel = (i == g_sr_sel);
+            if (hov||sel) fb_fill_rect(px+2, ry, pw-4, 24, COL_ACCENT_DIM);
+            fb_print(px+14, ry+4, g_sr_names[i],
+                     (hov||sel)?COL_TEXT_HI:COL_TEXT_MED,
+                     (hov||sel)?COL_ACCENT_DIM:COL_GLASS_PANEL);
         }
     } else if (g_search_query[0]) {
-        hline(px + 8u, py + 56u, pw - 16u, COL_SEP);
-        fb_print(px + 14u, py + 64u, "No matching apps", COL_TEXT_DIM, COL_GLASS_PANEL);
+        hline(px+8, py+56, pw-16, COL_SEP);
+        fb_print(px+14, py+64, "No matching apps", COL_TEXT_DIM, COL_GLASS_PANEL);
     }
 }
 
 /* =========================================================================
- * Login screen  (FIX [3]: bg_pixels background; FIX [2]: no fill_rect)
+ * Login screen
  * ========================================================================= */
 static void draw_login(void) {
-    uint32_t W=fb.width, H=fb.height;
-    /* FIX [3]: actual bg image, heavier overlay for login contrast */
-    blit_bg_scaled(0, 0, W, H, (g_bg_overlay > 80u) ? g_bg_overlay + 60u : 140u);
-    fb_fill_rect(0, 0, W, H, fb_blend(0x000000, 0, 110));
+    uint32_t W = fb.width, H = fb.height;
+    /* Render wallpaper with a heavier dark overlay for login contrast.
+     * DO NOT follow this with a solid fb_fill_rect — that would overwrite
+     * the wallpaper with a solid colour and leave a black background. */
+    blit_bg_scaled(0, 0, W, H, 180u);  /* higher overlay_a = darker tint */
 
-    uint32_t cw = (W > 440u) ? 380u : W - 40u;
-    uint32_t ch = (H > 380u) ? 320u : H - 40u;
-    uint32_t cx=(W-cw)/2, cy=(H-ch)/2;
-    /* FIX [2]: fill_col param — rounded corners preserved */
+    uint32_t cw = (W>440u)?380u:W-40u;
+    uint32_t ch = (H>380u)?320u:H-40u;
+    uint32_t cx = (W-cw)/2, cy = (H-ch)/2;
     glass_panel(cx, cy, cw, ch, COL_ACCENT, COL_GLASS_PANEL);
     fb_print_s(cx+60, cy+20, "DracolaxOS", COL_ACCENT_LT, COL_GLASS_PANEL, 2);
     hline(cx+16, cy+62, cw-32, COL_SEP);
     fb_print(cx+16, cy+72, "Sign in to your account", COL_TEXT_MED, 0);
 
-    int uf=(g_login_field==0);
-    uint32_t fy0=cy+104;
+    int uf = (g_login_field == 0);
+    uint32_t fy0 = cy+104;
     fb_print(cx+16, fy0, "Username", COL_TEXT_DIM, 0);
     fb_fill_rect(cx+16, fy0+18, cw-32, 28, uf?0x1E1E40u:0x141430u);
     fb_rounded_rect(cx+16, fy0+18, cw-32, 28, 4, uf?COL_ACCENT_LT:COL_SEP);
     fb_print(cx+22, fy0+24, g_login_user, COL_TEXT_HI, 0);
     if (uf && g_ticks%60<40) {
-        uint32_t cx4=cx+22+(uint32_t)strlen(g_login_user)*FONT_W;
+        uint32_t cx4 = cx+22+(uint32_t)strlen(g_login_user)*FONT_W;
         fb_fill_rect(cx4, fy0+24, 2, FONT_H, COL_ACCENT_LT);
     }
 
-    int pf=(g_login_field==1);
-    uint32_t fy1=fy0+64;
+    int pf = (g_login_field == 1);
+    uint32_t fy1 = fy0+64;
     fb_print(cx+16, fy1, "Password", COL_TEXT_DIM, 0);
     fb_fill_rect(cx+16, fy1+18, cw-32, 28, pf?0x1E1E40u:0x141430u);
     fb_rounded_rect(cx+16, fy1+18, cw-32, 28, 4, pf?COL_ACCENT_LT:COL_SEP);
-    char stars[LOGIN_BUF]; size_t plen=strlen(g_login_pass);
-    for (size_t si=0;si<plen&&si<LOGIN_BUF-1;si++) stars[si]='*';
-    stars[plen]='\0';
+    char stars[LOGIN_BUF];
+    size_t plen = strlen(g_login_pass);
+    for (size_t si = 0; si < plen && si < LOGIN_BUF-1; si++) stars[si] = '*';
+    stars[plen] = '\0';
     fb_print(cx+22, fy1+24, stars, COL_TEXT_HI, 0);
     if (pf && g_ticks%60<40) {
-        uint32_t cx4=cx+22+(uint32_t)plen*FONT_W;
+        uint32_t cx4 = cx+22+(uint32_t)plen*FONT_W;
         fb_fill_rect(cx4, fy1+24, 2, FONT_H, COL_ACCENT_LT);
     }
 
     uint32_t bx=cx+16, by=fy1+60, bw=cw-32, bh=32;
     fb_fill_rect(bx, by, bw, bh, COL_ACCENT);
     fb_rounded_rect(bx, by, bw, bh, 6, COL_ACCENT_LT);
-    text_center(bx, by+8, bw, "Log In", COL_TEXT_HI, COL_ACCENT);
+    uint32_t lw = 6u*FONT_W;
+    fb_print(bx+(bw-lw)/2, by+8, "Log In", COL_TEXT_HI, COL_ACCENT);
 
     if (g_login_msg[0]) {
-        uint32_t mc=g_login_msg_err?COL_ERR:COL_OK;
-        uint32_t mx2=cx+(cw-(uint32_t)strlen(g_login_msg)*FONT_W)/2;
-        fb_print(mx2, by+40, g_login_msg, mc, 0);
+        uint32_t mc = g_login_msg_err ? COL_ERR : COL_OK;
+        fb_print(cx+(cw-(uint32_t)strlen(g_login_msg)*FONT_W)/2,
+                 by+40, g_login_msg, mc, 0);
     }
     fb_print(cx+16, cy+ch-22,
              "Tab = switch field   Enter = login", COL_TEXT_DIM, 0);
 }
 
-/* =========================================================================
- * Login input handler
- * ========================================================================= */
 static void handle_login_key(char c) {
-    if (c=='\t') { g_login_field=1-g_login_field; return; }
-    if (c=='\n') {
-        int r=dracoauth_login(g_login_user, g_login_pass);
-        if (r==0) {
+    if (c == '\t') { g_login_field = 1-g_login_field; return; }
+    if (c == '\n') {
+        if (dracoauth_login(g_login_user, g_login_pass) == 0) {
             g_logged_in=1; g_wallpaper_dirty=1;
             snprintf(g_login_msg, sizeof(g_login_msg),
                      "Welcome, %s!", dracoauth_whoami());
@@ -649,381 +448,547 @@ static void handle_login_key(char c) {
         }
         return;
     }
-    if (c=='\b') {
-        char *buf=(g_login_field==0)?g_login_user:g_login_pass;
-        size_t l=strlen(buf); if (l>0) buf[l-1]='\0'; return;
+    if (c == '\b') {
+        char *buf = (g_login_field==0) ? g_login_user : g_login_pass;
+        size_t l = strlen(buf); if (l>0) buf[l-1]='\0'; return;
     }
-    if (c>=32 && c<127) {
-        char *buf=(g_login_field==0)?g_login_user:g_login_pass;
-        size_t l=strlen(buf);
-        if (l<LOGIN_BUF-1) { buf[l]=c; buf[l+1]='\0'; }
-    }
-}
-
-/* =========================================================================
- * Desktop interaction  (FIX [4][5])
- * ========================================================================= */
-static void close_overlays(void) {
-    g_start_open=0; g_search_open=0;
-}
-
-static void handle_desktop_click(int cx, int cy, int right) {
-    if (right) {
-        if (g_ctx_open) { g_ctx_open=0; return; }
-        close_overlays();
-        if (cx>=DOCK_W && cy>=TOPBAR_H) {
-            g_ctx_open=1; g_ctx_x=cx; g_ctx_y=cy;
-        }
-        return;
-    }
-
-    /* Left: context menu */
-    if (g_ctx_open) {
-        uint32_t mh=(uint32_t)CTX_COUNT*CTX_IH+10;
-        uint32_t mx=(uint32_t)g_ctx_x, my=(uint32_t)g_ctx_y;
-        if (mx+CTX_W>fb.width)  mx=fb.width-CTX_W;
-        if (my+mh>fb.height)    my=fb.height-mh;
-        for (int i=0;i<CTX_COUNT;i++) {
-            uint32_t iy=my+5+(uint32_t)i*CTX_IH;
-            if (cx>=(int)mx && cx<(int)(mx+CTX_W) &&
-                cy>=(int)iy  && cy<(int)(iy+CTX_IH)) {
-                switch(CTX_ITEMS[i].id) {
-                case CTX_ABOUT:    g_about_open=1; close_overlays(); break;
-                case CTX_LOGOUT:
-                    g_logged_in=0; g_login_pass[0]='\0';
-                    g_wallpaper_dirty=1; close_overlays(); g_about_open=0; break;
-                case CTX_TERMINAL: close_overlays(); appman_launch("Terminal"); break;
-                /* CTX_CHANGE_BG: cycle overlay alpha (darker→lighter→off→darker) */
-                case CTX_CHANGE_BG:
-                    if (g_bg_overlay > 180u) g_bg_overlay = 90u;
-                    else if (g_bg_overlay > 40u) g_bg_overlay = 10u;
-                    else g_bg_overlay = 200u;
-                    g_wallpaper_dirty = 1;
-                    break;
-                case CTX_REBOOT:   power_reboot();   break;
-                case CTX_SHUTDOWN: power_shutdown(); break;
-                }
-            }
-        }
-        g_ctx_open=0; return;
-    }
-
-    /* About close button */
-    if (g_about_open) {
-        uint32_t W=fb.width,H=fb.height,pw=480,ph=280;
-        uint32_t px=(W-pw)/2, py=(H-ph)/2;
-        if (cx>=(int)(px+pw-26) && cx<(int)(px+pw-8) &&
-            cy>=(int)(py+8)     && cy<(int)(py+26))
-            { g_about_open=0; g_wallpaper_dirty=1; }
-        return;
-    }
-
-    /* Start-menu app clicks — launch via appman */
-    if (g_start_open) {
-        uint32_t cell_w = (fb.width  > 900u) ? 116u : 96u;
-        uint32_t cell_h = (fb.height > 600u) ?  86u : 70u;
-        uint32_t cols   = START_COLS;
-        uint32_t rows   = ((uint32_t)g_am_count + cols - 1u) / cols;
-        uint32_t pw     = cols * cell_w + 24u;
-        uint32_t ph     = rows * cell_h + 52u;
-        uint32_t avail_w = fb.width  - (uint32_t)DOCK_W - 20u;
-        uint32_t avail_h = fb.height - (uint32_t)TOPBAR_H - 12u;
-        if (pw > avail_w) pw = avail_w;
-        if (ph > avail_h) ph = avail_h;
-        uint32_t px = (uint32_t)DOCK_W + 8u;
-        uint32_t py = (fb.height > ph + (uint32_t)TOPBAR_H + 8u)
-                      ? fb.height - ph - 8u : (uint32_t)TOPBAR_H + 4u;
-        int clicked = 0;
-        for (int i = 0; i < g_am_count; i++) {
-            uint32_t col2 = (uint32_t)(i % (int)cols);
-            uint32_t row2 = (uint32_t)(i / (int)cols);
-            uint32_t acx  = px + 12u + col2 * cell_w;
-            uint32_t acy  = py + 38u + row2 * cell_h;
-            uint32_t bw   = cell_w - 8u;
-            uint32_t bh   = cell_h - 8u;
-            if (cx >= (int)acx && cx < (int)(acx + bw) &&
-                cy >= (int)acy && cy < (int)(acy + bh)) {
-                appman_launch(g_am_names[i]);   /* launch via appman — wires ALL entries */
-                clicked = 1;
-                break;
-            }
-        }
-        (void)clicked;
-        /* Click outside closes menu */
-        if (cx < (int)px || cx >= (int)(px + pw) ||
-            cy < (int)py || cy >= (int)(py + ph)) {
-            g_am_count = 0;   /* force refresh next open */
-        }
-        g_start_open = 0; g_wallpaper_dirty = 1;
-        return;
-    }
-
-    /* Search overlay clicks */
-    if (g_search_open) {
-        uint32_t W2 = fb.width;
-        uint32_t pw = (W2 - (uint32_t)DOCK_W > 440u) ? 400u : W2 - (uint32_t)DOCK_W - 40u;
-        uint32_t result_h = (g_sr_count > 0) ? (uint32_t)g_sr_count * 24u + 8u : 0u;
-        uint32_t ph = 64u + result_h;
-        uint32_t px = (uint32_t)DOCK_W + (W2 - (uint32_t)DOCK_W - pw) / 2u;
-        uint32_t py = (uint32_t)TOPBAR_H + 12u;
-        /* Click on a result row — launch that app */
-        if (g_sr_count > 0 &&
-            cx >= (int)px && cx < (int)(px + pw) &&
-            cy >= (int)(py + 64u) && cy < (int)(py + ph)) {
-            int row = ((int)cy - (int)(py + 64u)) / 24;
-            if (row >= 0 && row < g_sr_count)
-                appman_launch(g_sr_names[row]);
-            g_search_open = 0; g_search_query[0] = '\0';
-            g_sr_count = 0; g_wallpaper_dirty = 1;
-            return;
-        }
-        /* Click outside overlay closes it */
-        if (cx < (int)px || cx >= (int)(px + pw) ||
-            cy < (int)py || cy >= (int)(py + ph)) {
-            g_search_open = 0; g_search_query[0] = '\0';
-            g_sr_count = 0; g_wallpaper_dirty = 1;
-        }
-        return;
-    }
-
-    /* FIX [4]: Dock button actions */
-    uint32_t btn_x=(DOCK_W-BTN_SZ)/2;
-    for (int i=0;i<DOCK_BTN_COUNT;i++) {
-        uint32_t btn_y=TOPBAR_H+DOCK_PAD+(uint32_t)i*(BTN_SZ+BTN_GAP);
-        if (cx>=(int)btn_x && cx<(int)(btn_x+BTN_SZ) &&
-            cy>=(int)btn_y  && cy<(int)(btn_y+BTN_SZ)) {
-            switch(i) {
-            case 0: g_start_open=!g_start_open; g_search_open=0;
-                    if (!g_start_open) g_am_count=0;  /* force refresh on next open */
-                    g_wallpaper_dirty=1; break;
-            case 1: g_search_open=!g_search_open; g_start_open=0;
-                    g_search_query[0]='\0'; g_wallpaper_dirty=1; break;
-            case 2:
-                /* FIX: launch proper Terminal app via appman, not debug console */
-                close_overlays();
-                appman_launch("Terminal");
-                break;
-            case 3: g_about_open=1; close_overlays(); break;
-            }
-        }
-    }
-
-    /* Workspace switcher click — geometry matches draw_dock */
-    uint32_t ws_total2 = (uint32_t)NUM_WORKSPACES*(20+4);
-    uint32_t ws_start2 = fb.height > ws_total2+16u ? fb.height - ws_total2 - 8u : fb.height/2;
-    for (int i=0;i<NUM_WORKSPACES;i++) {
-        uint32_t wy2=ws_start2+(uint32_t)i*(20+4);
-        if (cx>=4&&cx<DOCK_W-4&&cy>=(int)wy2&&cy<(int)(wy2+20))
-            { g_ws=i; g_wallpaper_dirty=1; wm_switch_desktop(g_ws); comp_switch_desktop(g_ws); }
+    if (c >= 32 && c < 127) {
+        char *buf = (g_login_field==0) ? g_login_user : g_login_pass;
+        size_t l = strlen(buf);
+        if (l < LOGIN_BUF-1) { buf[l]=c; buf[l+1]='\0'; }
     }
 }
 
 /* =========================================================================
  * Boot logo
  * ========================================================================= */
-static void draw_boot_logo(int fade_alpha) {
+static int g_boot_phase = 0, g_boot_ticks = 0;
+#define BOOT_LOGO_FRAMES 60
+#define BOOT_FADE_FRAMES 20
+
+static void draw_boot_logo(int fa) {
     uint32_t W=fb.width, H=fb.height;
     fb_clear(COL_VOID);
-    uint32_t cx=W/2, cy=H/2, sz=(H<W?H:W)/5;
-    uint32_t box=sz*2, ox=cx-sz, oy=cy-sz-20;
-    for (uint32_t py=0;py<box;py++) {
-        for (uint32_t px=0;px<box;px++) {
-            uint32_t bx=px*DRACO_LOGO_W/box, by2=py*DRACO_LOGO_H_PX/box;
+    uint32_t sz=(H<W?H:W)/5, box=sz*2;
+    uint32_t ox=W/2-sz, oy=H/2-sz-20;
+    for (uint32_t py2=0; py2<box; py2++) {
+        for (uint32_t px2=0; px2<box; px2++) {
+            uint32_t bx=px2*DRACO_LOGO_W/box, by2=py2*DRACO_LOGO_H_PX/box;
             uint32_t bidx=by2*DRACO_LOGO_W+bx;
             uint8_t byte=draco_logo_1bpp[bidx>>3];
             uint8_t bit=(byte>>(7-(bidx&7)))&1;
             if (!bit) continue;
-            int dx=(int)px-(int)sz, dy2=(int)py-(int)sz;
-            uint32_t d2=(uint32_t)(dx*dx+dy2*dy2), m2=sz*sz;
+            int dx=(int)px2-(int)sz, dy2=(int)py2-(int)sz;
+            uint32_t d2=(uint32_t)(dx*dx+dy2*dy2),m2=sz*sz;
             uint8_t blend=(d2<m2)?(uint8_t)(200+55*(m2-d2)/m2):200u;
             uint32_t col=fb_blend(0xFFFFFFu,0xAA66FFu,blend);
-            if (fade_alpha<255) {
-                uint8_t a=(uint8_t)fade_alpha;
-                col=fb_color((uint8_t)(((col>>16)&0xFF)*a/255),
-                             (uint8_t)(((col>>8 )&0xFF)*a/255),
-                             (uint8_t)((col&0xFF)*a/255));
-            }
-            if (ox+px<W && oy+py<H) fb_put_pixel(ox+px, oy+py, col);
+            if (fa<255){uint8_t a=(uint8_t)fa;col=fb_color((uint8_t)(((col>>16)&0xFF)*a/255),(uint8_t)(((col>>8)&0xFF)*a/255),(uint8_t)((col&0xFF)*a/255));}
+            if (ox+px2<W&&oy+py2<H) fb_put_pixel(ox+px2,oy+py2,col);
         }
     }
-    uint32_t col_txt=COL_TEXT_HI;
-    if (fade_alpha<255) {
-        uint8_t a=(uint8_t)fade_alpha;
-        col_txt=fb_color((uint8_t)(0xF0*a/255),(uint8_t)(0xF0*a/255),(uint8_t)(0xFF*a/255));
-    }
-    const char *name="DracolaxOS";
-    uint32_t nw=(uint32_t)strlen(name)*FONT2_W;
-    fb_print_s((W-nw)/2, oy+box+16, name, col_txt, 0, 2);
-    uint32_t col_ver=COL_TEXT_DIM;
-    if (fade_alpha<255) {
-        uint8_t a=(uint8_t)fade_alpha;
-        col_ver=fb_color((uint8_t)(0x60*a/255),(uint8_t)(0x60*a/255),(uint8_t)(0x7A*a/255));
-    }
-    const char *ver="v1.0";
-    uint32_t vw=(uint32_t)strlen(ver)*FONT_W;
-    fb_print((W-vw)/2, oy+box+16+FONT2_H+6, ver, col_ver, 0);
+    const char *nm="DracolaxOS"; uint32_t nw=(uint32_t)strlen(nm)*16;
+    uint32_t ct=COL_TEXT_HI;
+    if(fa<255){uint8_t a=(uint8_t)fa;ct=fb_color((uint8_t)(0xF0*a/255),(uint8_t)(0xF0*a/255),(uint8_t)(0xFF*a/255));}
+    fb_print_s((W-nw)/2,oy+box+16,nm,ct,0,2);
 }
 
 /* =========================================================================
- * Desktop main task
+ * Desktop task — entry point
  * ========================================================================= */
 void desktop_task(void) {
     __asm__ volatile ("sti");
-
-    /* FIX [5]: Lock fb_console BEFORE shadow-buffer ownership so no
-     * klog / irq-watchdog output bleeds into the GUI framebuffer. */
     fb_console_lock(1);
-    kinfo("DESKTOP: starting glassmorphism desktop\n");
+    kinfo("DESKTOP: v2.0 starting\n");
 
     if (!fb.available) {
-        vga_set_color(VGA_LIGHT_CYAN, VGA_BLACK);
-        vga_print("\n    DracolaxOS V1 — No VESA framebuffer.\n");
+        vga_print("\n    DracolaxOS — No VESA framebuffer.\n");
         vga_print("    Use mode=graphical in GRUB entry.\n");
-        vga_set_color(VGA_LIGHT_GREY, VGA_BLACK);
         for (;;) sched_sleep(1000);
     }
 
     fb_enable_shadow();
     fb_clear(COL_VOID);
     fb_flip();
-    cursor_init();   /* initialise kernel cursor driver */
+    cursor_init();
+    /* Explicitly initialise both subsystems — comp_task/wm_task are NOT
+     * spawned; desktop_task owns the render loop and drives them directly. */
+    comp_init();
+    wm_init();
+    sched_yield(); /* heartbeat after early hw init */
 
-    /* First-boot installer check */
+    /* Init dock (loads icons, sets default pins) */
+    dock_init();
+    sched_yield(); /* heartbeat after dock init */
+
+    /* First-boot installer */
     {
-        int need_setup=(dracoauth_login("__probe__","")!=0 &&
-                        dracoauth_login("root","dracolax")==0);
+        int ns = (dracoauth_login("__probe__","")!=0 &&
+                  dracoauth_login("root","dracolax")==0);
         dracoauth_logout();
-        if (need_setup) { kinfo("DESKTOP: first boot — installer\n"); installer_run(); }
+        if (ns) { kinfo("DESKTOP: first boot installer\n"); installer_run(); sched_yield(); }
     }
 
-    g_cx=(int)fb.width/2;
-    g_cy=(int)fb.height/2;
+    g_cx = (int)fb.width  / 2;
+    g_cy = (int)fb.height / 2;
 
     for (;;) {
         g_ticks++;
 
-        /* Boot phase */
-        if (g_boot_phase<2) {
+        /* ── Boot logo ── */
+#ifndef DRACO_STABLE
+        if (g_boot_phase < 2) {
             g_boot_ticks++;
-            if (g_boot_phase==0) {
+            if (g_boot_phase == 0) {
                 draw_boot_logo(255); fb_flip();
-                if (g_boot_ticks>=BOOT_LOGO_FRAMES){g_boot_phase=1;g_boot_ticks=0;}
+                if (g_boot_ticks >= BOOT_LOGO_FRAMES) { g_boot_phase=1; g_boot_ticks=0; }
             } else {
                 int alpha=255-g_boot_ticks*255/BOOT_FADE_FRAMES;
-                if (alpha<0) alpha=0;
+                if(alpha<0)alpha=0;
                 draw_boot_logo(alpha); fb_flip();
-                if (g_boot_ticks>=BOOT_FADE_FRAMES){
-                    g_boot_phase=2;g_boot_ticks=0;
-                    fb_clear(COL_VOID);fb_flip();g_wallpaper_dirty=1;
+                if (g_boot_ticks>=BOOT_FADE_FRAMES) {
+                    g_boot_phase=2; g_boot_ticks=0;
+                    fb_clear(COL_VOID); fb_flip(); g_wallpaper_dirty=1;
                 }
             }
             sched_sleep(33); continue;
         }
+#else
+        g_boot_phase=2; g_wallpaper_dirty=1;
+#endif
 
-        /* Input */
-        vmmouse_poll();
+        /* ── Mouse input ── */
+        /* CRITICAL ORDER: mouse_update_edges() FIRST to snapshot previous button
+         * state, THEN vmmouse_poll() to update current state.
+         * Reversed order caused mbuttons == mbuttons_prev always → btn_pressed = 0. */
         mouse_update_edges();
-
-        /* FIX [1]: Only update cursor from mouse on actual movement */
-        int new_mx=mouse_get_x(), new_my=mouse_get_y();
-        if (new_mx!=g_mouse_x_raw || new_my!=g_mouse_y_raw) {
-            g_cx=new_mx; g_cy=new_my;
-            g_mouse_x_raw=new_mx; g_mouse_y_raw=new_my;
+        vmmouse_poll();
+        int nmx=mouse_get_x(), nmy=mouse_get_y();
+        if (nmx!=g_mouse_x_raw||nmy!=g_mouse_y_raw) {
+            g_cx=nmx; g_cy=nmy;
+            g_mouse_x_raw=nmx; g_mouse_y_raw=nmy;
         }
 
+        /* ── Keyboard input ── */
         int c;
         while ((c=keyboard_getchar())!=0) {
             uint8_t uc=(uint8_t)c;
-            /* FIX [1]: arrow keys update raw tracker so next mouse move
-             * starts from the keyboard-adjusted position, not the old one */
-            if      (uc==KB_KEY_UP)    {g_cy-=4;if(g_cy<0)g_cy=0;g_mouse_x_raw=g_cx;g_mouse_y_raw=g_cy;}
-            else if (uc==KB_KEY_DOWN)  {g_cy+=4;if(g_cy>=(int)fb.height)g_cy=(int)fb.height-1;g_mouse_x_raw=g_cx;g_mouse_y_raw=g_cy;}
-            else if (uc==KB_KEY_LEFT)  {g_cx-=4;if(g_cx<0)g_cx=0;g_mouse_x_raw=g_cx;g_mouse_y_raw=g_cy;}
-            else if (uc==KB_KEY_RIGHT) {g_cx+=4;if(g_cx>=(int)fb.width)g_cx=(int)fb.width-1;g_mouse_x_raw=g_cx;g_mouse_y_raw=g_cy;}
-            else if (uc==KB_KEY_ALTTAB){g_ws=(g_ws+1)%NUM_WORKSPACES;g_wallpaper_dirty=1;wm_switch_desktop(g_ws);comp_switch_desktop(g_ws);}
-            else if (uc==KB_KEY_F12)   {dbgcon_toggle();}
-            else if (!g_logged_in)     {handle_login_key((char)c);}
-            else {
-                if (c==0x1B) {
-                    if (g_about_open)       {g_about_open=0;g_wallpaper_dirty=1;}
-                    else if (g_ctx_open)    {g_ctx_open=0;}
-                    else if (g_start_open)  {g_start_open=0;g_wallpaper_dirty=1;}
-                    else if (g_search_open) {g_search_open=0;g_search_query[0]='\0';g_sr_count=0;g_wallpaper_dirty=1;}
+
+            /* Arrow keys move cursor */
+            if(uc==KB_KEY_UP)   {g_cy-=4;if(g_cy<0)g_cy=0;g_mouse_x_raw=g_cx;g_mouse_y_raw=g_cy;continue;}
+            if(uc==KB_KEY_DOWN) {g_cy+=4;if(g_cy>=(int)fb.height)g_cy=(int)fb.height-1;g_mouse_x_raw=g_cx;g_mouse_y_raw=g_cy;continue;}
+            if(uc==KB_KEY_LEFT) {g_cx-=4;if(g_cx<0)g_cx=0;g_mouse_x_raw=g_cx;g_mouse_y_raw=g_cy;continue;}
+            if(uc==KB_KEY_RIGHT){g_cx+=4;if(g_cx>=(int)fb.width)g_cx=(int)fb.width-1;g_mouse_x_raw=g_cx;g_mouse_y_raw=g_cy;continue;}
+
+            if(uc==KB_KEY_F12){dbgcon_toggle();continue;}
+
+            if(!g_logged_in){handle_login_key((char)c);continue;}
+
+            /* Workspace switcher swallows all keys while open */
+            if(ws_switcher_is_open()){
+                int nws=ws_switcher_key(c,g_ws);
+                if(nws>=0){
+                    g_ws=nws;g_wallpaper_dirty=1;
+                    wm_switch_desktop(g_ws);comp_switch_desktop(g_ws);
+                } else if(!ws_switcher_is_open()){
+                    /* Closed via ESC/Tab without switching — must redraw
+                     * wallpaper to clear the tint applied by ws_switcher_draw(). */
+                    g_wallpaper_dirty=1;
                 }
-                if (g_search_open && c >= 32 && c < 127) {
-                    size_t l = strlen(g_search_query);
-                    if (l < SEARCH_BUF - 1) {
-                        g_search_query[l] = (char)c;
-                        g_search_query[l+1] = '\0';
-                    }
-                    search_update_results();
-                } else if (g_search_open && c == '\b') {
-                    size_t l = strlen(g_search_query);
-                    if (l > 0) g_search_query[l - 1] = '\0';
-                    search_update_results();
-                } else if (g_search_open && (c == '\n' || c == '\r')) {
-                    /* Enter: launch selected (or first) result */
-                    int target = (g_sr_sel < g_sr_count) ? g_sr_sel :
-                                 (g_sr_count > 0 ? 0 : -1);
-                    if (target >= 0) appman_launch(g_sr_names[target]);
-                    g_search_open = 0;
-                    g_search_query[0] = '\0';
-                    g_sr_count = 0;
+                continue;
+            }
+
+            /* Tab → workspace switcher — mark wallpaper dirty so the
+             * switcher's tint starts from a fresh background not an
+             * already-tinted shadow buffer. */
+            if(c=='\t'){g_wallpaper_dirty=1;ws_switcher_open();continue;}
+
+            /* Escape → close top overlay */
+            if(c==0x1B){
+                if(g_about_open){g_about_open=0;g_wallpaper_dirty=1;}
+                else if(ctx_menu_is_open()){ctx_menu_close();}
+                else if(g_search_open){g_search_open=0;g_search_query[0]='\0';g_sr_count=0;g_wallpaper_dirty=1;}
+                continue;
+            }
+
+            /* Ctrl+F → toggle search */
+            if(c==0x06){
+                g_search_open=!g_search_open;
+                if(!g_search_open){g_search_query[0]='\0';g_sr_count=0;}
+                g_wallpaper_dirty=1; continue;
+            }
+
+            /* Ctrl+W — DEBUG: open a plain 300×300 test window.
+             * If this window appears, the compositor pipeline is working
+             * and the problem is in the app launch chain.
+             * If it does NOT appear, the compositor itself is broken. */
+            if(c==0x17){
+                int dbg_w = comp_create_window("DEBUG TEST WINDOW",
+                    (int)(fb.width/2)  - 150,
+                    (int)(fb.height/2) - 150,
+                    300u, 300u);
+                if(dbg_w >= 0){
+                    /* Fill bright magenta so it can't be confused with anything */
+                    comp_window_fill(dbg_w, 0, 0, 300u, 300u, 0xFF00FFu);
+                    comp_window_print(dbg_w, 10u, 10u,
+                        "Ctrl+W debug window", 0xFFFFFFu);
+                    comp_window_print(dbg_w, 10u, 30u,
+                        "If visible: compositor OK", 0xFFFF00u);
+                    comp_window_print(dbg_w, 10u, 50u,
+                        "Close: right-click dock", 0xCCCCCCu);
+                    kinfo("DESKTOP: debug window created id=%d\n", dbg_w);
+                } else {
+                    kinfo("DESKTOP: debug window FAILED (compositor full or heap)\n");
+                }
+                g_wallpaper_dirty=1; continue;
+            }
+
+            /* Ctrl+B — DEBUG: toggle wallpaper off/on.
+             * With bg disabled the screen fills solid dark grey. Any window
+             * that was hidden behind the wallpaper will become visible.
+             * If a window appears after Ctrl+B → draw order bug (window rendered
+             * before wallpaper, then overwritten). */
+            if(c==0x02){
+                g_bg_disabled = !g_bg_disabled;
+                g_wallpaper_dirty=1;
+                kinfo("DESKTOP: bg %s\n", g_bg_disabled?"OFF":"ON");
+                continue;
+            }
+
+            /* Search typing */
+            if(g_search_open){
+                if(c>=32&&c<127){
+                    size_t l=strlen(g_search_query);
+                    if(l<SEARCH_BUF-1){g_search_query[l]=(char)c;g_search_query[l+1]='\0';}
+                    search_update();
+                    /* BUG FIX: panel height changes when results appear/disappear.
+                     * Without a fresh wallpaper blit the old (larger or smaller)
+                     * panel area leaves ghost pixels behind the new one. */
                     g_wallpaper_dirty = 1;
-                } else if (g_search_open && (uint8_t)c == KB_KEY_DOWN) {
-                    if (g_sr_sel < g_sr_count - 1) g_sr_sel++;
-                } else if (g_search_open && (uint8_t)c == KB_KEY_UP) {
-                    if (g_sr_sel > 0) g_sr_sel--;
-                }
-                if (c>=1 && c<=4) {g_ws=c-1;g_wallpaper_dirty=1;wm_switch_desktop(g_ws);comp_switch_desktop(g_ws);}
+                }else if(c=='\b'){
+                    size_t l=strlen(g_search_query);
+                    if(l>0)g_search_query[l-1]='\0';
+                    search_update();
+                    g_wallpaper_dirty = 1; /* same reason as above */
+                }else if(c=='\n'||c=='\r'){
+                    int t=(g_sr_sel<g_sr_count)?g_sr_sel:(g_sr_count>0?0:-1);
+                    if(t>=0)appman_launch(g_sr_names[t]);
+                    g_search_open=0;g_search_query[0]='\0';g_sr_count=0;
+                }else if(uc==KB_KEY_DOWN&&g_sr_sel<g_sr_count-1){g_sr_sel++;}
+                else if(uc==KB_KEY_UP&&g_sr_sel>0){g_sr_sel--;}
+                continue;
+            }
+
+            /* F1..F4 → direct workspace switch (was Ctrl+1..4, which intercepted Ctrl+C/D) */
+            if(uc==KB_KEY_F1||uc==KB_KEY_F2||uc==KB_KEY_F3||uc==KB_KEY_F4){
+                g_ws=(int)(uc-KB_KEY_F1);
+                g_wallpaper_dirty=1;
+                wm_switch_desktop(g_ws);
+                comp_switch_desktop(g_ws);
             }
         }
 
-        /* Mouse clicks */
-        /* BUG FIX 1.3: clamp cursor to screen bounds before any click dispatch,
-         * guards against edge values from raw mouse_get_x/y or arrow key wrap. */
-        if (g_cx < 0) g_cx = 0;
-        if (g_cy < 0) g_cy = 0;
-        if (g_cx >= (int)fb.width)  g_cx = (int)fb.width  - 1;
-        if (g_cy >= (int)fb.height) g_cy = (int)fb.height - 1;
+        /* ── Clamp cursor ── */
+        if(g_cx<0)g_cx=0;
+        if(g_cy<0)g_cy=0;
+        if(g_cx>=(int)fb.width) g_cx=(int)fb.width-1;
+        if(g_cy>=(int)fb.height)g_cy=(int)fb.height-1;
 
-        if (mouse_btn_pressed(MOUSE_BTN_LEFT)) {
-            if (!g_logged_in) {
-                /* FIX 1.2: use the same responsive formula as draw_login()
-                 * so the hit-box always matches the rendered button position. */
-                uint32_t W=fb.width, H=fb.height;
-                uint32_t cw=(W>440u)?380u:W-40u;
-                uint32_t ch=(H>380u)?320u:H-40u;
+        /* ── Window drag: update position each frame while left button held ── */
+        if(g_drag_win >= 0) {
+            if(mouse_btn_held(MOUSE_BTN_LEFT)) {
+                int nx = g_cx - g_drag_off_x;
+                int ny = g_cy - g_drag_off_y;
+                if(nx < 0) nx = 0;
+                if(ny < 0) ny = 0;
+                if(nx > (int)fb.width  - 40) nx = (int)fb.width  - 40;
+                if(ny > (int)fb.height - 30) ny = (int)fb.height - 30;
+                comp_move_window(g_drag_win, (uint32_t)nx, (uint32_t)ny);
+                g_wallpaper_dirty = 1;
+            } else {
+                g_drag_win = -1;   /* button released — stop dragging */
+            }
+        }
+
+        /* ── Window resize: update geometry each frame while left button held ─
+         * Only active when a resize edge was captured on the mouse-down event.
+         * The resize is computed as a delta from the geometry at drag-start so
+         * that accumulated floating-point error never creeps in.               */
+        if(g_resize_win >= 0) {
+            if(mouse_btn_held(MOUSE_BTN_LEFT)) {
+                int dx = g_cx - g_resize_mx;
+                int dy = g_cy - g_resize_my;
+                int nx = g_resize_ox, ny = g_resize_oy;
+                int nw = g_resize_ow, nh = g_resize_oh;
+                switch(g_resize_edge) {
+                case RESIZE_E:  nw = g_resize_ow + dx; break;
+                case RESIZE_S:  nh = g_resize_oh + dy; break;
+                case RESIZE_W:  nx = g_resize_ox + dx; nw = g_resize_ow - dx; break;
+                case RESIZE_N:  ny = g_resize_oy + dy; nh = g_resize_oh - dy; break;
+                case RESIZE_SE: nw = g_resize_ow + dx; nh = g_resize_oh + dy; break;
+                case RESIZE_SW: nx = g_resize_ox + dx; nw = g_resize_ow - dx;
+                                nh = g_resize_oh + dy; break;
+                case RESIZE_NE: nh = g_resize_oh - dy; ny = g_resize_oy + dy;
+                                nw = g_resize_ow + dx; break;
+                case RESIZE_NW: nx = g_resize_ox + dx; nw = g_resize_ow - dx;
+                                ny = g_resize_oy + dy; nh = g_resize_oh - dy; break;
+                default: break;
+                }
+                /* Clamp: keep on screen and enforce minimum size */
+                if(nw < 120) { if(nx != g_resize_ox) nx = g_resize_ox + g_resize_ow - 120; nw = 120; }
+                if(nh <  60) { if(ny != g_resize_oy) ny = g_resize_oy + g_resize_oh -  60; nh =  60; }
+                if(nx < 0) nx = 0;
+                if(ny < 0) ny = 0;
+                comp_set_geometry(g_resize_win,
+                                  (uint32_t)nx, (uint32_t)ny,
+                                  (uint32_t)nw, (uint32_t)nh);
+                g_wallpaper_dirty = 1;
+            } else {
+                g_resize_win  = -1;
+                g_resize_edge = RESIZE_NONE;
+            }
+        }
+
+        /* ── Mouse clicks ── */
+        if(mouse_btn_pressed(MOUSE_BTN_LEFT)){
+            if(!g_logged_in){
+                /* Login button hit-test */
+                uint32_t W=fb.width,H=fb.height;
+                uint32_t cw=(W>440u)?380u:W-40u, ch=(H>380u)?320u:H-40u;
                 uint32_t lcx=(W-cw)/2, lcy=(H-ch)/2;
-                uint32_t fy1=lcy+104u+64u;          /* same offsets as draw_login */
-                uint32_t bx=lcx+16, by=fy1+60, bw=cw-32, bh=32;
-                (void)ch;
-                if (g_cx>=(int)bx&&g_cx<(int)(bx+bw)&&g_cy>=(int)by&&g_cy<(int)(by+bh))
+                uint32_t fy1=lcy+104u+64u;
+                uint32_t bx=lcx+16,by=fy1+60,bw=cw-32,bh=32; (void)ch;
+                if(g_cx>=(int)bx&&g_cx<(int)(bx+bw)&&g_cy>=(int)by&&g_cy<(int)(by+bh))
                     handle_login_key('\n');
-            } else { handle_desktop_click(g_cx,g_cy,0); }
-        }
-        if (mouse_btn_pressed(MOUSE_BTN_RIGHT)) {
-            if (g_logged_in) handle_desktop_click(g_cx,g_cy,1);
+            } else if(ws_switcher_is_open()){
+                int nws=ws_switcher_click(g_cx,g_cy);
+                if(nws>=0){
+                    g_ws=nws;g_wallpaper_dirty=1;
+                    wm_switch_desktop(g_ws);comp_switch_desktop(g_ws);
+                } else if(!ws_switcher_is_open()){
+                    g_wallpaper_dirty=1;
+                }
+            } else if(ctx_menu_is_open()){
+                /* ── Layer 1 → 3: forward click to context menu ──────────── */
+                int consumed = ctx_menu_click(g_cx, g_cy);
+                if(!consumed){
+                    /* Click was outside the menu — dismiss and fall through
+                     * so the click still interacts with whatever is below. */
+                    ctx_menu_close();
+                    /* Do NOT fall-through into window/dock handling on this
+                     * same frame — avoids accidentally activating elements
+                     * that were under the menu. */
+                }
+                g_wallpaper_dirty = 1;
+            } else if(g_about_open){
+                uint32_t W=fb.width,H=fb.height,pw=480,ph=280;
+                uint32_t px=(W-pw)/2,py=(H-ph)/2;
+                if(g_cx>=(int)(px+pw-26)&&g_cx<(int)(px+pw-8)&&g_cy>=(int)(py+8)&&g_cy<(int)(py+26)){g_about_open=0;g_wallpaper_dirty=1;}
+            } else if(g_search_open){
+                uint32_t dock_right=(uint32_t)(DOCK_PANEL_X+DOCK_W+12);
+                uint32_t avail=fb.width-dock_right;
+                uint32_t pw=(avail>440u)?400u:avail-40u;
+                uint32_t rh=g_sr_count>0?(uint32_t)g_sr_count*24u+8u:0u;
+                uint32_t ph=64u+rh, px2=dock_right+(avail-pw)/2, py2=20u;
+                if(g_sr_count>0&&g_cx>=(int)px2&&g_cx<(int)(px2+pw)&&g_cy>=(int)(py2+64u)&&g_cy<(int)(py2+ph)){
+                    int row=((int)g_cy-(int)(py2+64u))/24;
+                    if(row>=0&&row<g_sr_count)appman_launch(g_sr_names[row]);
+                    g_search_open=0;g_search_query[0]='\0';g_sr_count=0;g_wallpaper_dirty=1;
+                }else if(g_cx<(int)px2||g_cx>=(int)(px2+pw)||g_cy<(int)py2||g_cy>=(int)(py2+ph)){
+                    g_search_open=0;g_search_query[0]='\0';g_sr_count=0;g_wallpaper_dirty=1;
+                }
+            } else {
+                /* ── Window title bar click: close / maximize / minimize / drag ── */
+                int wid = comp_title_bar_at(g_cx, g_cy);
+                if(wid >= 0) {
+                    comp_focus_window(wid);
+                    g_wallpaper_dirty = 1;
+                    if(comp_close_at(wid, g_cx, g_cy)) {
+                        /* Close: destroy window, notify dock.
+                         * BUG FIX (freeze on exit): clear drag/resize state
+                         * that may hold this handle — if left dangling the
+                         * next frame tries to move/resize a dead window and
+                         * the compositor index is reused unpredictably.
+                         * Also return keyboard focus to the desktop task (0)
+                         * so the main loop receives keys again. */
+                        int tid = comp_get_task_id(wid);
+                        dock_task_died(tid);
+                        comp_destroy_window(wid);
+                        if(g_drag_win   == wid) g_drag_win   = -1;
+                        if(g_resize_win == wid) { g_resize_win = -1; g_resize_edge = RESIZE_NONE; }
+                        input_router_set_focus(0); /* return focus to desktop */
+                    } else if(comp_maximize_at(wid, g_cx, g_cy)) {
+                        /* Maximize/restore toggle */
+                        comp_toggle_maximize(wid);
+                    } else if(comp_minimize_at(wid, g_cx, g_cy)) {
+                        /* Minimize: hide window (toggle visible) */
+                        comp_set_visible(wid, 0);
+                    } else {
+                        /* Not on a button — start drag */
+                        int ox, oy;
+                        comp_get_pos(wid, &ox, &oy);
+                        g_drag_win   = wid;
+                        g_drag_off_x = g_cx - ox;
+                        g_drag_off_y = g_cy - oy;
+                    }
+                } else {
+                    /* ── Dock gets FIRST priority — its 6px resize halo
+                     * must not swallow dock clicks.  Check the dock before
+                     * comp_window_at so icon clicks always reach dock_click(). */
+                    if(dock_click(g_cx, g_cy)) {
+                        /* dock handled it — nothing more to do */
+                    } else {
+                    /* ── Resize edge check (window border) ── */
+                    int rwid = comp_window_at(g_cx, g_cy);
+                    if(rwid >= 0) {
+                        resize_edge_t edge = comp_resize_edge_at(rwid, g_cx, g_cy);
+                        if(edge != RESIZE_NONE) {
+                            comp_focus_window(rwid);
+                            g_resize_win  = rwid;
+                            g_resize_edge = edge;
+                            g_resize_mx   = g_cx;
+                            g_resize_my   = g_cy;
+                            int rx,ry,rw,rh;
+                            comp_get_geometry(rwid,&rx,&ry,&rw,&rh);
+                            g_resize_ox = rx; g_resize_oy = ry;
+                            g_resize_ow = rw; g_resize_oh = rh;
+                            g_wallpaper_dirty = 1;
+                        } else {
+                            /* Click inside body — focus but no drag/resize */
+                            comp_focus_window(rwid);
+                            g_wallpaper_dirty = 1;
+                        }
+                    }
+                    /* else: click was on empty desktop — no action */
+                    }
+                }
+            }
         }
 
-        /* Draw */
-        if (!g_logged_in) {
+        /* ── Right-click: 3-layer context menu system ──────────────────────
+         *   Layer 1 (input): detected here — mouse_btn_pressed(RIGHT)
+         *   Layer 2 (resolver): ctx_resolve(x, y) classifies the target
+         *   Layer 3 (UI): ctx_menu_open(&hit) renders correct menu
+         *
+         * Also forward to dock_right_click() so pin/unpin still works
+         * via direct right-click on a dock slot (legacy path).
+         */
+        if(mouse_btn_pressed(MOUSE_BTN_RIGHT) && g_logged_in && !ws_switcher_is_open()){
+            /* Close any open menu first (toggle behaviour). */
+            if(ctx_menu_is_open()){
+                ctx_menu_close();
+            } else {
+                /* Let dock handle pin/unpin right-click internally */
+                int dock_consumed = dock_right_click(g_cx, g_cy);
+                /* Always open a context menu regardless — dock_right_click
+                 * does its pin toggle, ctx_menu shows the dock menu too. */
+                (void)dock_consumed;
+                ctx_hit_t hit = ctx_resolve(g_cx, g_cy);
+                ctx_menu_open(&hit);
+            }
+            g_wallpaper_dirty = 1;
+        }
+
+        /* ── Draw ── */
+        if(!g_logged_in){
             draw_login();
         } else {
-            draw_wallpaper();
-            draw_dock();
-            draw_topbar();
-            draw_ctx_menu();
-            draw_about();
-            draw_start_menu();
-            draw_search_overlay();
-            wm_render_frame();   /* BUG FIX 1.2/1.8: composite WM windows on top of desktop */
-            comp_render();       /* BUG FIX (dock): composite app windows into shadow buffer */
+            /* When the workspace switcher is open: redraw wallpaper every frame
+             * so ws_switcher_draw always tints from a clean base.
+             * This prevents the "frozen dark screen" that happened when we tinted
+             * an already-tinted buffer, AND prevents the one-frame flash that
+             * happened when wallpaper was redrawn but tint was only applied once. */
+            if (ws_switcher_is_open()) g_wallpaper_dirty = 1;
+            else if (comp_has_windows()) g_wallpaper_dirty = 1;
+            draw_wallpaper();                    /* full-screen bg, marks clean */
+            wm_render_frame();                   /* WM windows */
+            comp_render();                       /* compositor windows */
+            draw_about();                        /* about overlay */
+            draw_search();                       /* search overlay */
+            if(ws_switcher_is_open())
+                ws_switcher_draw(g_cx,g_cy,g_ws); /* workspace switcher */
+            dock_draw(g_cx,g_cy);   /* dock drawn above windows */
+            ctx_menu_draw(g_cx, g_cy); /* context menu TOPMOST — above dock */
         }
 
         dbgcon_draw();
-        fb_flip();                              /* push shadow to VRAM first */
-        cursor_move((uint32_t)g_cx, (uint32_t)g_cy); /* stamp cursor onto VRAM after flip */
+        fb_flip();
+
+        /* ── Cursor shape update ────────────────────────────────────────
+         * Determine the correct cursor for the current hover target and
+         * apply it every frame AFTER fb_flip() so cursor_move() stamps
+         * the right bitmap onto VRAM.
+         *
+         * Priority (highest first):
+         *  1. Active drag     → GRAB
+         *  2. Active resize   → RESIZE_H / RESIZE_V (kept during drag)
+         *  3. Resize edge     → RESIZE_H / RESIZE_V
+         *  4. Title bar       → ARROW
+         *  5. Window body     → TEXT (all app windows are terminal-style)
+         *  6. Dock hover      → HAND
+         *  7. Search input    → TEXT (only the text-entry rect)
+         *  8. Elsewhere       → ARROW
+         */
+        {
+            cursor_type_t ctype = CURSOR_ARROW;
+
+            if (g_drag_win >= 0) {
+                /* Active window drag — closed fist */
+                ctype = CURSOR_GRAB;
+            } else if (g_resize_win >= 0) {
+                /* Active resize — keep resize direction cursor */
+                switch (g_resize_edge) {
+                case RESIZE_E: case RESIZE_W:
+                case RESIZE_NW: case RESIZE_SE: ctype = CURSOR_RESIZE_H; break;
+                case RESIZE_N: case RESIZE_S:
+                case RESIZE_NE: case RESIZE_SW: ctype = CURSOR_RESIZE_V; break;
+                default: ctype = CURSOR_ARROW; break;
+                }
+            } else if (g_logged_in) {
+                /* Check resize edges on any hovered window */
+                int hwid = comp_window_at(g_cx, g_cy);
+                if (hwid >= 0) {
+                    resize_edge_t re = comp_resize_edge_at(hwid, g_cx, g_cy);
+                    switch (re) {
+                    case RESIZE_E: case RESIZE_W:
+                    case RESIZE_NW: case RESIZE_SE: ctype = CURSOR_RESIZE_H; break;
+                    case RESIZE_N: case RESIZE_S:
+                    case RESIZE_NE: case RESIZE_SW: ctype = CURSOR_RESIZE_V; break;
+                    default: ctype = CURSOR_ARROW; break;
+                    }
+                    if (re == RESIZE_NONE) {
+                        /* Inside window — title bar gets arrow, body gets text */
+                        if (comp_title_bar_at(g_cx, g_cy) >= 0)
+                            ctype = CURSOR_ARROW;
+                        else
+                            ctype = CURSOR_TEXT; /* terminal/app body */
+                    }
+                } else if (dock_hover_slot() >= 0) {
+                    ctype = CURSOR_HAND;
+                } else if (g_search_open) {
+                    /* TEXT only over the actual text-input field, not the
+                     * whole panel.  Recompute search input rect here. */
+                    uint32_t dock_right = (uint32_t)(DOCK_PANEL_X + DOCK_W + 12);
+                    uint32_t avail = fb.width - dock_right;
+                    uint32_t pw = (avail > 440u) ? 400u : avail - 40u;
+                    uint32_t px_s = dock_right + (avail - pw) / 2;
+                    uint32_t py_s = 20u;
+                    /* Input field: fx = px_s+40, fy = py_s+14, fw = pw-56, fh = 28 */
+                    uint32_t fx = px_s + 40u;
+                    uint32_t fy = py_s + 14u;
+                    uint32_t fw = pw - 56u;
+                    uint32_t fh = 28u;
+                    if (g_cx >= (int)fx && g_cx < (int)(fx + fw) &&
+                        g_cy >= (int)fy && g_cy < (int)(fy + fh)) {
+                        ctype = CURSOR_TEXT;
+                    }
+                    /* else arrow over result list, close hint, etc. */
+                }
+            }
+
+            cursor_set_type(ctype);
+        }
+
+        cursor_move((uint32_t)g_cx,(uint32_t)g_cy);
         sched_sleep(33);
     }
 }

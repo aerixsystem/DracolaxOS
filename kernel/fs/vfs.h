@@ -28,6 +28,11 @@ typedef struct vfs_node {
 /* Mount a filesystem root at a path (simple flat mount table) */
 int  vfs_mount(const char *path, vfs_node_t *root);
 
+/* Sanitize and normalize a VFS path.
+ * Collapses double slashes, strips ".", REJECTS ".." (returns -1).
+ * Always call this on paths received from user space before vfs_open(). */
+int  vfs_path_sanitize(const char *src, char *dst, size_t dstsz);
+
 /* Resolve a path to a node; returns NULL if not found.
  * Uses longest-prefix-first mount matching + recursive path walking. */
 vfs_node_t *vfs_open(const char *path);

@@ -91,6 +91,9 @@ void kmain(uint32_t magic, uint32_t mbi_addr) {
 
     if (sched_spawn(init_task, "init") < 0)
         kpanic("Failed to spawn init_task");
+    /* init runs at HIGH priority and is exempt from watchdog killing
+     * (it deliberately holds the CPU during hardware enumeration phases) */
+    sched_set_priority(1, PRIO_HIGH);
 
     kinfo("kmain idle\n");
     for (;;) { __asm__ volatile ("hlt"); sched_yield(); }

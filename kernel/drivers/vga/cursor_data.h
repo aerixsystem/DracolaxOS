@@ -274,6 +274,43 @@ static const uint32_t cursor_resize_v_data[32*32] = {
     T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
 };
 
+/* ─── GRAB / CLOSED FIST (hotspot 8,2) ──────────────────────────────
+ * Shown during active window drag. Closed-hand shape, fingers curled. */
+static const uint32_t cursor_grab_data[32*32] = {
+    T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    T,T,B,B,T,B,B,T,T,B,B,T,B,B,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    T,B,W,W,B,W,W,B,B,W,W,B,W,W,B,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    T,B,W,W,W,W,W,W,W,W,W,W,W,W,B,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    B,W,W,W,W,W,W,W,W,W,W,W,W,W,W,B,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    B,W,W,W,W,W,W,W,W,W,W,W,W,W,W,B,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    B,W,W,W,W,W,W,W,W,W,W,W,W,W,W,B,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    B,W,W,W,W,W,W,W,W,W,W,W,W,W,W,B,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    B,W,W,W,W,W,W,W,W,W,W,W,W,W,W,B,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    B,W,W,W,W,W,W,W,W,W,W,W,W,W,W,B,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    T,B,W,W,W,W,W,W,W,W,W,W,W,W,B,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    T,B,W,W,W,W,W,W,W,W,W,W,W,W,B,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    T,T,B,W,W,W,W,W,W,W,W,W,W,B,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    T,T,T,B,B,B,B,B,B,B,B,B,B,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+    T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,
+};
+
 /* Update cursor.c defs to reference all types */
 #undef T
 #undef B

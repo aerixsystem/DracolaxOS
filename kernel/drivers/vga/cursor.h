@@ -14,6 +14,7 @@ typedef enum {
     CURSOR_BUSY     = 4,
     CURSOR_RESIZE_H = 5,
     CURSOR_RESIZE_V = 6,
+    CURSOR_GRAB     = 7,   /* closed fist — active window drag */
 } cursor_type_t;
 
 typedef struct {

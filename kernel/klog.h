@@ -27,6 +27,10 @@ void klog_crash_dump(const char *proc, const char *reason,
 /* Periodic flush task — register with sched_spawn(klog_flush_task, "klog") */
 void klog_flush_task(void);
 
+/* Emergency drain: write all buffered entries to serial without VFS.
+ * Safe to call from kpanic() with interrupts disabled. */
+void klog_drain_to_serial(void);
+
 /* Convenience: write a formatted line to kernel channel */
 void klog_kinfo (const char *fmt, ...);
 void klog_kerror(const char *fmt, ...);

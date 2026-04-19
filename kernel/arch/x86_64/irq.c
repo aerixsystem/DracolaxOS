@@ -3,8 +3,10 @@
 #include "irq.h"
 #include "pic.h"
 #include "../../log.h"
+#include "../../klog.h"
 #include "../../klibc.h"
 #include "../../drivers/serial/serial.h"
+#include "../../sched/sched.h"
 
 static irq_handler_t handlers[256];
 
@@ -35,15 +37,21 @@ static void default_exception(struct isr_frame *f) {
     const char *name = (f->int_no < 32) ? exception_name[f->int_no] : "Unknown";
     char buf[512];
 
+    /* ── Fault origin: Ring 3 (user task) or Ring 0 (kernel)? ──────────
+     * CS bottom 2 bits = CPL. If CPL == 3 the fault came from user space.
+     * For user faults: log the fault, kill the offending task, continue.
+     * For kernel faults: full panic (no safe way to continue). */
+    int from_user = (f->cs & 3) == 3;
+
     if (f->int_no == 14) {
+        /* Page fault */
         uint64_t cr2 = 0;
         __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
 
         const char *reason = (f->err_code & PF_PRESENT) ? "protection" : "not-present";
         const char *access = (f->err_code & PF_WRITE)   ? "write"      : "read";
-        const char *ring   = (f->err_code & PF_USER)    ? "user"       : "kernel";
+        const char *ring   = from_user                   ? "user"       : "kernel";
 
-        /* Immediate serial output before panic screen (in case panic itself faults) */
         serial_print("\n[FAULT] Page Fault at 0x");
         char hx[17]; static const char *hex = "0123456789ABCDEF";
         uint64_t v = cr2;
@@ -57,39 +65,38 @@ static void default_exception(struct isr_frame *f) {
 
         snprintf(buf, sizeof(buf),
             "Page Fault\n"
-            "  Fault addr : 0x%llx\n"
-            "  Reason     : %s page, %s access from %s mode\n"
-            "  RIP        : 0x%llx\n"
-            "  ErrCode    : 0x%llx (P=%u W=%u U=%u RSV=%u ID=%u)\n"
-            "  CS=0x%llx  RFLAGS=0x%llx  RSP=0x%llx\n"
-            "\n"
-            "  Tips:\n"
-            "  - Physical addr not mapped in page tables\n"
-            "  - NULL pointer / stack overflow\n"
-            "  - Framebuffer mapping issue in fb.c\n",
-            (unsigned long long)cr2,
-            reason, access, ring,
-            (unsigned long long)f->rip,
-            (unsigned long long)f->err_code,
-            !!(f->err_code & PF_PRESENT), !!(f->err_code & PF_WRITE),
-            !!(f->err_code & PF_USER),    !!(f->err_code & PF_RESERVED),
-            !!(f->err_code & PF_FETCH),
+            "  Addr   : 0x%llx\n"
+            "  Reason : %s page, %s access from %s mode\n"
+            "  RIP    : 0x%llx  ErrCode: 0x%llx\n"
+            "  CS=0x%llx  RFLAGS=0x%llx  RSP=0x%llx\n",
+            (unsigned long long)cr2, reason, access, ring,
+            (unsigned long long)f->rip, (unsigned long long)f->err_code,
             (unsigned long long)f->cs,
-            (unsigned long long)f->rflags,
-            (unsigned long long)f->rsp);
+            (unsigned long long)f->rflags, (unsigned long long)f->rsp);
     } else {
         snprintf(buf, sizeof(buf),
             "%s (vector %llu)\n"
             "  RIP=0x%llx  CS=0x%llx\n"
             "  RFLAGS=0x%llx  err=0x%llx\n",
             name, (unsigned long long)f->int_no,
-            (unsigned long long)f->rip,
-            (unsigned long long)f->cs,
-            (unsigned long long)f->rflags,
-            (unsigned long long)f->err_code);
+            (unsigned long long)f->rip, (unsigned long long)f->cs,
+            (unsigned long long)f->rflags, (unsigned long long)f->err_code);
     }
 
-    kpanic(buf);
+    if (from_user) {
+        /* ── User-space fault: kill the task, don't crash the kernel ── */
+        task_t *t = sched_current();
+        kerror("FAULT [user] in task '%s' (id=%d): %s",
+               t ? t->name : "?", sched_current_id(), buf);
+        klog_crash_dump(t ? t->name : "unknown", buf, "user-mode fault");
+        /* Kill the faulting task and schedule the next one */
+        sched_kill(sched_current_id());
+        /* sched_kill calls sched_exit() for the current task — does not return */
+        __builtin_unreachable();
+    } else {
+        /* ── Kernel-mode fault: full panic, no recovery possible ─────── */
+        kpanic(buf);
+    }
 }
 
 static void default_irq(struct isr_frame *f) { (void)f; }

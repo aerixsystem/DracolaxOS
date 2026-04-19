@@ -233,3 +233,6 @@ int mouse_btn_pressed(uint8_t mask) {
 int mouse_btn_released(uint8_t mask) {
     return (int)(!(mbuttons & mask) && (mbuttons_prev & mask));
 }
+int mouse_btn_held(uint8_t mask) {
+    return (int)((mbuttons & mask) != 0);
+}

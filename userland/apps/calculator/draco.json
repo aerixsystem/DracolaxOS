@@ -1,0 +1,23 @@
+{
+  "name": "calculator",
+  "display_name": "Calculator",
+  "version": "1.0.0",
+  "description": "Simple integer calculator for DracolaxOS shell.",
+  "author": "Lunax",
+  "license": "MIT",
+  "entry": "calculator",
+  "type": "cli",
+  "requirements": {
+    "os_version": ">=2.0",
+    "memory_kb": 128,
+    "syscalls": ["read", "write", "exit"]
+  },
+  "install_path": "/storage/apps/calculator",
+  "tags": ["tool", "math"],
+  "node_id": "05",
+  "storage": {
+    "data":    "/storage/apps/calculator/data",
+    "configs": "/storage/apps/calculator/configs",
+    "cache":   "/storage/apps/calculator/cache"
+  }
+}
