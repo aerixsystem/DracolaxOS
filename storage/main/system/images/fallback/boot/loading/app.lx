@@ -1,0 +1,56 @@
+import os
+from PIL import Image
+
+def hex_to_rgb(hex_color):
+    hex_color = hex_color.lstrip("#")
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+def remove_color_from_image(image_path, target_color):
+    img = Image.open(image_path).convert("RGBA")
+    data = img.getdata()
+
+    new_data = []
+    for pixel in data:
+        r, g, b, a = pixel
+
+        if (r, g, b) == target_color:
+            new_data.append((r, g, b, 0))  # make transparent
+        else:
+            new_data.append((r, g, b, a))
+
+    img.putdata(new_data)
+
+    output_name = os.path.splitext(image_path)[0] + "_no_bg.png"
+    img.save(output_name, "PNG")
+    print(f"[OK] Saved: {output_name}")
+
+def main():
+    user_input = input("Enter color HEX to remove (default #000000): ").strip()
+
+    if not user_input:
+        user_input = "#000000"
+
+    try:
+        target_color = hex_to_rgb(user_input)
+    except:
+        print("Invalid HEX color.")
+        return
+
+    current_dir = os.getcwd()
+    files = os.listdir(current_dir)
+
+    image_files = [f for f in files if f.lower().endswith((".png", ".jpg", ".jpeg"))]
+
+    if not image_files:
+        print("No images found.")
+        return
+
+    print(f"Removing color {target_color} from {len(image_files)} images...")
+
+    for image in image_files:
+        remove_color_from_image(image, target_color)
+
+    print("Done.")
+
+if __name__ == "__main__":
+    main()

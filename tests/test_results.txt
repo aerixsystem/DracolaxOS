@@ -1,0 +1,83 @@
+==> Building /home/claude/work/tests/test_allocator.c
+==> Running /tmp/test_allocator
+[PASS] alloc 64 bytes returns non-NULL
+[PASS] alloc is 16-byte aligned
+[PASS] heap_used increases after alloc
+[PASS] alloc after exhaustion returns NULL
+[PASS] limits: 1MB actual use on 128MB does not trigger CRITICAL
+[PASS] limits: 90%+ real usage correctly triggers CRITICAL
+[PASS] freelist: alloc 100 bytes
+[PASS] freelist: alloc 200 bytes
+[PASS] freelist: second alloc after first
+[PASS] freelist: alloc after free reuses block
+[PASS] freelist: large alloc after full coalesce
+freelist subtotal: 5 passed, 0 failed
+
+6 passed, 0 failed
+==> Building /home/claude/work/tests/test_keyboard.c
+==> Running /tmp/test_keyboard
+[PASS] push/pop ASCII char
+[PASS] empty ring returns 0
+[PASS] Tab character survives ring
+[PASS] Enter character survives ring
+[PASS] KB_KEY_UP (0x80) survives ring
+[PASS] ring drops excess when full (no overflow)
+[PASS] ring wrap-around preserves order
+
+7 passed, 0 failed
+==> Building /home/claude/work/tests/test_log_rotation.c
+==> Running /tmp/test_log_rotation
+[PASS] log path contains year
+[PASS] no rotation before 9000 lines
+[PASS] rotation at 9000 lines
+[PASS] line count reset after rotation
+[PASS] rotated path is different from previous
+[PASS] sequential rotation increments file_idx
+
+6 passed, 0 failed
+==> Building /home/claude/work/tests/test_wm.c
+/home/claude/work/tests/test_wm.c:23:25: warning: 'focused_id' defined but not used [-Wunused-variable]
+   23 | static int win_count=0, focused_id=-1, current_desktop=0;
+      |                         ^~~~~~~~~~
+==> Running /tmp/test_wm
+[PASS] first window id is 0
+[PASS] window position set correctly
+[PASS] snap left sets state
+[PASS] snap left sets x=0
+[PASS] snap left sets w=half screen
+[PASS] snap right sets x=half
+[PASS] switch to desktop 2
+[PASS] new window assigned to current desktop
+
+8 passed, 0 failed
+==> Building LXScript parser test
+==> Running /tmp/test_lxs_parser
+[PASS] lex: 'let' keyword
+[PASS] lex: identifier 'x'
+[PASS] lex: '=' operator
+[PASS] lex: integer literal 42
+[PASS] lex: semicolon
+[PASS] lex: string literal
+[PASS] lex: string literal length (with quotes)
+[PASS] lex: float literal
+[PASS] lex: all keyword types recognised
+[PASS] parse: non-null result
+[PASS] parse: program is block
+[PASS] parse: block has statements
+[PASS] parse: let statement
+[PASS] parse: fn declaration
+[PASS] parse: if statement
+[PASS] parse: while loop
+[PASS] parse: binary expression
+[PASS] parse: '+' is root (precedence correct)
+[PASS] parse: function call
+[PASS] parse: call name is 'print'
+[PASS] parse: no parse errors
+[PASS] parse: nested fn+if+let
+[PASS] parse: two let statements
+
+23 passed, 0 failed
+
+==========================
+Test results: 5 passed, 0 failed
+==========================

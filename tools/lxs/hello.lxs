@@ -1,0 +1,23 @@
+// hello.lxs — DracolaxOS LXScript test
+// Run from shell: lxs /storage/hello.lxs
+//            or: lxs -e "print(42)"
+
+let msg = "Hello from LXScript!";
+print(msg);
+
+let x = 10;
+let y = 20;
+let sum = x + y;
+print(sum);
+
+if (sum > 25) {
+    print("sum is greater than 25");
+} else {
+    print("sum is 25 or less");
+}
+
+let i = 0;
+while (i < 3) {
+    print(i);
+    i = i + 1;
+}

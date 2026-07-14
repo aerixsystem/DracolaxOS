@@ -1,0 +1,26 @@
+<svg width="100" height="100" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<linearGradient id="mainGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+<stop offset="0%" stop-color="#00FFFF" />
+<stop offset="50%" stop-color="#0055FF" />
+<stop offset="100%" stop-color="#9900FF" />
+</linearGradient>
+<radialGradient id="innerGlow" cx="50%" cy="50%" r="50%" fx="30%" fy="30%">
+<stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.4" />
+<stop offset="100%" stop-color="#FFFFFF" stop-opacity="0" />
+</radialGradient>
+<filter id="frosted" x="-20%" y="-20%" width="140%" height="140%">
+<feGaussianBlur in="SourceGraphic" stdDeviation="1.5" result="blur" />
+<feComposite in="SourceGraphic" in2="blur" operator="over" />
+</filter>
+<filter id="outerGlow" x="-50%" y="-50%" width="200%" height="200%">
+<feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#00FFFF" flood-opacity="0.5" />
+</filter>
+</defs>
+<path d="M15,35 Q15,30 20,30 L40,30 L45,25 Q47,22 50,22 L80,22 Q85,22 85,27 L85,35" fill="none" stroke="url(#mainGrad)" stroke-width="1.2" stroke-opacity="0.6" />
+<g filter="url(#outerGlow)">
+<path d="M15,40 Q15,35 20,35 L80,35 Q85,35 85,40 L85,73 Q85,78 80,78 L20,78 Q15,78 15,73 Z" fill="url(#mainGrad)" fill-opacity="0.25" filter="url(#frosted)" stroke="url(#mainGrad)" stroke-width="1.5" stroke-opacity="0.5" />
+<path d="M15,40 Q15,35 20,35 L80,35 Q85,35 85,40 L85,73 Q85,78 80,78 L20,78 Q15,78 15,73 Z" fill="url(#innerGlow)" pointer-events="none" />
+<path d="M18,38 L45,38 Q48,38 48,41 L18,55 Z" fill="#FFFFFF" fill-opacity="0.15" />
+</g>
+</svg>
