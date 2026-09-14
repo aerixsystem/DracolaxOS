@@ -27,14 +27,13 @@ jobs:
             grub-pc-bin \
             grub-common \
             xorriso \
+            mtools \
             qemu-system-x86 \
             gcc-x86-64-linux-gnu \
             binutils-x86-64-linux-gnu
 
       - name: Build
-        run: |
-          make
+        run: make
 
       - name: Run tests
-        run: |
-          make tests
+        run: make tests
