@@ -69,7 +69,7 @@ My usual workflow is roughly:
 9. Wait hours for the usage limit to reset
 10. Get the project zip
 11. Extract
-13. Repeat
+12. Repeat
 
 I also test some parts on real hardware when possible. QEMU is extremely useful, but hardware can expose problems that an emulator does not.
 
@@ -192,7 +192,7 @@ The roadmap changes as the project develops.
 | 5     | LXScript userland APIs        | In progress |
 | 6     | Hardware testing and release  | Planned     |
 | 7     | Rust for Memory Manager       | Complete    |
-| 7     | Stubs (audio, images, network)| In progress |
+| 8     | Stubs (audio, images, network)| In progress |
 
 ## Documentation
 
