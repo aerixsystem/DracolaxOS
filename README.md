@@ -65,7 +65,7 @@ I still have to understand what changed, test it, look at the results and decide
 
 ## Development environment
 
-The project is primarily developed and tested on Linux (Debian).
+All the development happens on Linux, specifically Dedian.
 
 The project uses an x86_64-elf-gcc cross-compiler toolchain, NASM, GRUB tools, Xorriso and QEMU.
 I also use other tools (like python) when they are useful for debugging and testing on specific parts of the OS.
@@ -141,6 +141,8 @@ The project is still changing, so the structure may change as I keep working on 
 * Phase 4: Wine integration
 * Phase 6: Real hardware testing & release
 
+> *No promises that this roadmap is actually genuine...*
+
 ## Documentation
 
 Some parts of the project have their own documentation:
@@ -159,7 +161,7 @@ DracolaxOS is not finished, not even close.
 There are working components, experimental components and components that still need more work. 
 I am currently focused on getting the existing system stable before continually adding new features (while also handling school and coming exams).
 
-The goal is to have the things that are already implemented actually work together reliably.
+The goal is to have the things that are already implemented actually work together.
 
 Right now I am implementing Network. After that, audio is next.
 
