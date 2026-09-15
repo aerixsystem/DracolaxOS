@@ -22,33 +22,12 @@ At one point, QEMU was also getting too slow to use normally, which made develop
 
 ## What I have built
 
-The project currently contains several parts of a complete operating system:
+* **Core Kernel & Hardware:** GDT/IDT/TSS, physical page allocator, virtual memory management, and process scheduling (supporting Ring 0 and Ring 3).
+* **Storage & Drivers:** Basic ATA drive support, PS/2 keyboard/mouse input, and initial USB stack handling.
+* **Networking & Filesystem:** Custom VFS supporting RAMFS and procfs, with a basic TCP/IP-adjacent stack (ARP, IPv4, ICMP, UDP).
+* **Graphics & Shell:** Custom framebuffer compositor for basic window rendering, coupled with LXScript and initial Linux syscall stubs.
 
-- x86_64 freestanding kernel
-- GDT, IDT and TSS
-- Ring 0 and Ring 3 execution
-- System calls
-- Physical and virtual memory management
-- Paging
-- Process scheduling
-- Userland applications
-- ATA storage support
-- PS/2 keyboard and mouse support
-- USB support
-- Ethernet networking
-- ARP, IPv4, ICMP and UDP
-- Virtual filesystem
-- RAMFS and procfs
-- Framebuffer graphics
-- GUI compositor
-- Window management
-- LXScript
-- Linux syscall compatibility work
-- DracoShield security components
-- DRX package and update system
-- System services
-
-Some of these components are still incomplete because I am on the foundation first.
+> *Note: Many high-level services (like DracoShield and DRX) are still skeleton implementations because I am focusing on stabilizing the kernel memory first.*
 
 ## How I develop DracolaxOS
 
@@ -79,101 +58,67 @@ I also test some parts on real hardware when possible. QEMU is extremely useful,
 
 I use AI tools during development.
 
-I mainly use them for things such as:
+I mainly use them for things such as: Discussing possible designs, Reviewing code, Finding bugs, Explaining unfamiliar concepts, Generating ideas, Helping investigate difficult problems
 
-- Discussing possible designs
-- Reviewing code
-- Finding bugs
-- Explaining unfamiliar concepts
-- Generating ideas
-- Helping investigate difficult problems
-
-I do not treat generated code as automatically correct. Changes still have to make sense in the project and I test them myself.
+*I do not treat generated code as automatically correct. Changes still have to make sense in the project and I test them myself.*
 
 A kernel is a particularly bad place to blindly trust generated code. One small mistake can turn into a completely broken system.
 
 ## Development environment
 
-The project is primarily developed and tested on Linux.
+The project is primarily developed and tested on Linux, specifically Dedian.
 
-The main tools used by the project include:
-
-- GCC or an x86_64 cross compiler
-- NASM
-- GRUB tools
-- Xorriso
-- QEMU
-- GDB
-- Make
+You will need a working x86_64 ELF cross-compiler toolchain (`x86_64-elf-gcc`, `nasm`), `grub-mkrescue`, `xorriso`, and `qemu-system-x86_64`.
 
 ## Building
 
-Install the required dependencies, if needed:
-
+First, pull the build dependencies:
 ```bash
 make install-deps
 ````
 
-Build the kernel and ISO:
-
+To compile, assemble code and output the bootable ISO image:
 ```bash
 make
 ```
 
-Run DracolaxOS in QEMU:
-
+To test in QEMU (using serial output redirected to terminal):
 ```bash
 make run-qemu
 ```
 
-Run with debugging enabled:
-
-```bash
-make run-debug
-```
-
-Run without the graphical interface:
-
-```bash
-make run-headless
-```
-
-Run in VirtualBox:
-
+Run in Oracle VirtualBox:
 ```bash
 make run-vbox
 ```
 
-Run the test suite:
-
+Some useful debug/testing flags:
 ```bash
+make run-debug
+make run-headless
 make tests
 ```
 
 Clean the build:
-
 ```bash
 make clean
 ```
 
-## Project structure
-
-The repository is organized into several major parts:
+## Repository Structure
 
 ```text
-kernel/      Kernel code
-gui/         GUI, compositor and window management
-apps/        Userland applications
-services/    System services
-drx/         Package and update system
-lxscript/    LXScript
-libc/        Minimal freestanding libc
-runtimes/    Runtime integrations
-tools/       Development tools
-build/       Build and boot configuration
-docs/        Project documentation
-tests/       Tests
-storage/     Runtime storage tree
+apps/ -> OS built-in apps
+build/ -> Contains Linker and Grub
+docs/ -> Some Documents about the OS (AI Generated)
+drx/ -> Future OS Updater, just a skeleton, it has nothing to do with the project at the moment
+gui/ -> The GUI system of the OS
+kernel/ -> The OS kernel
+lxscript/ -> the OS programming language and also script
+services/ -> OS services
+storage/ -> This is nothing, just designing the OS FS as an actual storage on my linux (I will delete this in the future or the next update)
+tests/ -> The OS tests
+tools/ -> Tools I made with Gemini for the OS own image format
+userland/ -> ...
 ```
 
 The project is still changing, so the structure may change as I keep working on it.
@@ -185,25 +130,26 @@ The roadmap changes as the project develops.
 | Phase | Focus                         | Status      |
 | ----- | ----------------------------- | ----------- |
 | 0     | Project restructure           | Complete    |
-| 1     | Kernel stability and userland | Paused      |
-| 2     | GUI and desktop               | Paused      |
+| 1     | GUI Bugs Fixes                | Complete?   |
+| 2     | .dxi icon System              | Complete    |
 | 3     | DRX package and update system | Planned     |
 | 4     | Wine integration              | Planned     |
 | 5     | LXScript userland APIs        | In progress |
 | 6     | Hardware testing and release  | Planned     |
 | 7     | Rust for Memory Manager       | Complete    |
 | 8     | Stubs (audio, images, network)| In progress |
+| X     | Kernel Hardening              | Complete    |
 
 ## Documentation
 
 Some parts of the project have their own documentation:
 
-* [`docs/STRUCTURE.md`](docs/STRUCTURE.md) - Source tree layout
-* [`docs/DRX_SPEC.md`](docs/DRX_SPEC.md) - DRX design
-* [`docs/DXI_FORMAT.md`](docs/DXI_FORMAT.md) - DXI icon format
-* [`docs/WINE_INTEGRATION.md`](docs/WINE_INTEGRATION.md) - Wine integration design
-* [`docs/architecture.md`](docs/architecture.md) - System architecture
-* [`docs/api_reference.md`](docs/api_reference.md) - Kernel API
+* [`docs/STRUCTURE.md`](docs/STRUCTURE.md) -> Contains Source tree layout
+* [`docs/DRX_SPEC.md`](docs/DRX_SPEC.md) -> Contains DRX design
+* [`docs/DXI_FORMAT.md`](docs/DXI_FORMAT.md) -> Contains DXI icon format
+* [`docs/WINE_INTEGRATION.md`](docs/WINE_INTEGRATION.md) -> Contains Wine integration design
+* [`docs/architecture.md`](docs/architecture.md) -> Contains The System architecture
+* [`docs/api_reference.md`](docs/api_reference.md) -> Contains Kernel APIs
 
 ## Current state
 
