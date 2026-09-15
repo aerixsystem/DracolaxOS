@@ -12,15 +12,16 @@ A custom x86_64 operating system built from scratch in C and Assembly.
 
 ## Why I started this
 
-I wanted to learn how computers work below the level that I normally interact with as a programmer.
-I started with the basic boot and kernel code and gradually added more parts of the system.
+I started DracolaxOS because I wanted to make my own operating system instead of only using one. why? I don't know.
 
-Instead of only reading about kernels and operating systems, I wanted to actually build one and deal with the problems myself.
+Basically... I wanted to see how far I could go, starting from the boot process and kernel and then adding memory management, GUI mode, services, my own language and formats.
 
-That means DracolaxOS has gone through a lot of broken builds, crashes, incomplete drivers and things that worked in QEMU but did not behave the way I expected. 
+A lot of this project came from experimenting. The programming language, formats, etc. 
+Some things looked simple from the outside, but they turned out to be much harder once I decided to implement them.
+
 At one point, QEMU was also getting too slow to use normally, which made development even more annoying.
 
-## What I have built
+## What I currently have built
 
 * **Core Kernel & Hardware:** GDT/IDT/TSS, physical page allocator, virtual memory management, and process scheduling (supporting Ring 0 and Ring 3).
 * **Storage & Drivers:** Basic ATA drive support, PS/2 keyboard/mouse input, and initial USB stack handling.
@@ -31,7 +32,7 @@ At one point, QEMU was also getting too slow to use normally, which made develop
 
 ## How I develop DracolaxOS
 
-Most of my development happens on Linux.
+All the development happens on Linux, specifically Dedian.
 
 I use QEMU a lot because constantly rebooting real hardware while working on a kernel gets painful very quickly. I use serial output and debugging tools to see what the kernel is doing when the graphical interface is not enough.
 
@@ -56,19 +57,20 @@ I also test some parts on real hardware when possible. QEMU is extremely useful,
 
 ## AI-assisted development
 
-I use AI tools during development.
+I use AI tools during development, mainly GPT and Claude.
+I use them when I get stuck, when I need another way to look at a problem, when I want code reviewed, or when I need help working through a subsystem.
 
-I mainly use them for things such as: Discussing possible designs, Reviewing code, Finding bugs, Explaining unfamiliar concepts, Generating ideas, Helping investigate difficult problems
+The AI does not get to decide whether something belongs in DracolaxOS. 
+I still have to understand what changed, test it, look at the results and decide what to keep, change or remove.
 
-*I do not treat generated code as automatically correct. Changes still have to make sense in the project and I test them myself.*
-
-A kernel is a particularly bad place to blindly trust generated code. One small mistake can turn into a completely broken system.
+For this project, AI is part of my development workflow, not a replacement for actually working on the OS.
 
 ## Development environment
 
-The project is primarily developed and tested on Linux, specifically Dedian.
+The project is primarily developed and tested on Linux (Debian).
 
-You will need a working x86_64 ELF cross-compiler toolchain (`x86_64-elf-gcc`, `nasm`), `grub-mkrescue`, `xorriso`, and `qemu-system-x86_64`.
+The project uses an x86_64-elf-gcc cross-compiler toolchain, NASM, GRUB tools, Xorriso and QEMU.
+I also use other tools (like python) when they are useful for debugging and testing on specific parts of the OS.
 
 ## Building
 
